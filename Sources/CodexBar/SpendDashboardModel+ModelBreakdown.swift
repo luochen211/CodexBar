@@ -264,7 +264,9 @@ extension SpendDashboardModel {
     }
 
     private static func hasCompleteModelCostCoverage(_ entry: CostUsageDailyReport.Entry) -> Bool {
-        guard entry.incompleteRequestCount == 0 else { return false }
+        guard entry.incompleteRequestCount == 0,
+              (entry.unpricedRequestCount ?? 0) == 0
+        else { return false }
         var totalCost = 0.0
         var sawNamedBreakdown = false
         for breakdown in entry.modelBreakdowns ?? [] {

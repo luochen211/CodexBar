@@ -104,6 +104,8 @@ extension CostUsageScanner {
         var breakdown: [CostUsageDailyReport.ModelBreakdown] = []
         var dayCost: Double = 0
         var dayCostSeen = false
+        var dayPricedRequestCount = 0
+        var dayUnpricedRequestCount = 0
 
         for model in modelNames {
             guard OpenCodexRouteDispatcher.countsTowardCodexSubscription(modelName: model) else { continue }
@@ -122,8 +124,26 @@ extension CostUsageScanner {
                 dayReasoning.add(row.reasoning)
             }
 
-            let rowCost = rows.isEmpty ? nil : Self.codexRowCostBreakdown(
-                rows: rows,
+            var pricedRows: [CodexUsageRow] = []
+            var unpricedRequestCount = 0
+            for row in rows {
+                let hasTokens = row.input > 0 || row.cached > 0 || row.output > 0
+                let hasIncompletePricing = (row.unpricedTokens ?? 0) > 0 || (hasTokens
+                    && Self.codexResolvedCostUSD(
+                        for: row,
+                        priorityTurns: pricing.priorityTurns,
+                        modelsDevCatalog: pricing.modelsDevCatalog,
+                        modelsDevCacheRoot: pricing.modelsDevCacheRoot,
+                        customPricing: pricing.customPricing,
+                        pricingResolver: pricing.pricingResolver) == nil)
+                if hasIncompletePricing {
+                    unpricedRequestCount = CostUsageIncompleteRequests.sum([unpricedRequestCount, 1])
+                } else {
+                    pricedRows.append(row)
+                }
+            }
+            let rowCost = pricedRows.isEmpty ? nil : Self.codexRowCostBreakdown(
+                rows: pricedRows,
                 priorityTurns: pricing.priorityTurns,
                 modelsDevCatalog: pricing.modelsDevCatalog,
                 modelsDevCacheRoot: pricing.modelsDevCacheRoot,
@@ -137,10 +157,11 @@ extension CostUsageScanner {
                 && CheckedSum.integers(rows.map(\.input)) == input
                 && CheckedSum.integers(rows.map(\.cached)) == cached
                 && CheckedSum.integers(rows.map(\.output)) == output
+            let pricedRowTokens = CheckedSum.integers(pricedRows.flatMap { [max(0, $0.input), max(0, $0.output)] })
             let rowCostIsTrusted = !pricing.unresolvedRowGroups.contains(group)
                 && !pricing.modeOwnershipMismatchGroups.contains(group)
                 && (authoritativeOverflowCost
-                    || totalTokens.map { rowCost?.isTrusted(canonicalTotalTokens: $0) == true } == true)
+                    || pricedRowTokens.map { rowCost?.isTrusted(canonicalTotalTokens: $0) == true } == true)
             let aggregateCost = pricing.requestPricingEvidenceGroups.contains(group)
                 || pricing.incompletePricingEvidenceGroups.contains(group)
                 || (pricing.unresolvedRowGroups.contains(group)
@@ -161,6 +182,8 @@ extension CostUsageScanner {
                 ? rowCost?.totalCostUSD ?? aggregateCost
                 : aggregateCost
             let hasModeSplit = rowCostIsTrusted && rowCost?.hasModeSplit == true
+            dayPricedRequestCount = CostUsageIncompleteRequests.sum([dayPricedRequestCount, pricedRows.count])
+            dayUnpricedRequestCount = CostUsageIncompleteRequests.sum([dayUnpricedRequestCount, unpricedRequestCount])
             breakdown.append(
                 CostUsageDailyReport.ModelBreakdown(
                     modelName: model,
@@ -194,8 +217,9 @@ extension CostUsageScanner {
             costUSD: entryCost,
             modelsUsed: modelNames,
             modelBreakdowns: Self.sortedModelBreakdowns(breakdown),
-            unpricedRequestCount: entryCost == nil && (dayTotal ?? 1) > 0 ? 1 : nil,
-            unmeteredRequestCount: unmetered > 0 ? unmetered : nil)
+            unpricedRequestCount: dayUnpricedRequestCount > 0 ? dayUnpricedRequestCount : nil,
+            unmeteredRequestCount: unmetered > 0 ? unmetered : nil,
+            pricedRequestCount: dayPricedRequestCount > 0 ? dayPricedRequestCount : nil)
     }
 }
 
