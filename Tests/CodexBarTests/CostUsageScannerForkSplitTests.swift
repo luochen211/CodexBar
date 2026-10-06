@@ -322,6 +322,58 @@ struct CostUsageScannerForkSplitTests {
     }
 
     @Test
+    func `unreconciled billed groups retain unpriced coverage beside priced groups`() throws {
+        let environment = try CostUsageTestEnvironment()
+        defer { environment.cleanup() }
+
+        let day = try environment.makeLocalNoon(year: 2026, month: 9, day: 11)
+        let range = CostUsageScanner.CostUsageDayRange(since: day, until: day)
+        let dayKey = range.sinceKey
+        let pricedModel = "gpt-5.4"
+        let unresolvedModel = "gpt-5.5"
+        let pricedRow = CostUsageScanner.CodexUsageRow(
+            day: dayKey,
+            model: pricedModel,
+            turnID: "priced",
+            eventIndex: 0,
+            input: 100_000,
+            cached: 0,
+            output: 10,
+            pricingModel: pricedModel)
+        let unresolvedRow = CostUsageScanner.CodexUsageRow(
+            day: dayKey,
+            model: unresolvedModel,
+            turnID: "unresolved",
+            eventIndex: 1,
+            input: 100_000,
+            cached: 0,
+            output: 10,
+            pricingModel: "unpriced-test-model")
+        let usage = CostUsageScanner.makeFileUsage(
+            mtimeUnixMs: 1,
+            size: 1,
+            days: [dayKey: [
+                pricedModel: [100_000, 0, 10],
+                unresolvedModel: [200_000, 0, 20],
+            ]],
+            parsedBytes: 1,
+            codexRows: [pricedRow, unresolvedRow],
+            codexScanComplete: true)
+        var cache = CostUsageCache()
+        cache.files = ["/unreconciled-group.jsonl": usage]
+        cache.days = usage.days
+
+        let report = CostUsageScanner.buildCodexReportFromCache(cache: cache, range: range)
+        let pricedCost = try #require(CostUsagePricing.codexCostUSD(
+            model: pricedModel,
+            inputTokens: 100_000,
+            cachedInputTokens: 0,
+            outputTokens: 10))
+        #expect(abs((report.summary?.totalCostUSD ?? 0) - pricedCost) < 1e-12)
+        #expect(report.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 1, unpriced: 1))
+    }
+
+    @Test
     func `exact codex pricing rows retain persisted order`() {
         let dayKey = "2026-09-11"
         let model = "gpt-5.6-sol"

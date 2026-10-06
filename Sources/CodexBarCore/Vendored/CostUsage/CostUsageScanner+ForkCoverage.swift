@@ -182,6 +182,11 @@ extension CostUsageScanner {
                 ? rowCost?.totalCostUSD ?? aggregateCost
                 : aggregateCost
             let hasModeSplit = rowCostIsTrusted && rowCost?.hasModeSplit == true
+            let hasUnpricedUnreconciledGroup = rows.isEmpty
+                && (input > 0 || cached > 0 || output > 0)
+                && pricing.unresolvedRowGroups.contains(group)
+                && cost == nil
+            let unpricedUnreconciledGroupCount = hasUnpricedUnreconciledGroup ? 1 : 0
             let acceptedPricedRequestCount = rowCostIsTrusted ? pricedRows.count : 0
             let rejectedPricedRequestCount = pricedRows.count - acceptedPricedRequestCount
             dayPricedRequestCount = CostUsageIncompleteRequests.sum([
@@ -192,6 +197,7 @@ extension CostUsageScanner {
                 dayUnpricedRequestCount,
                 unpricedRequestCount,
                 rejectedPricedRequestCount,
+                unpricedUnreconciledGroupCount,
             ])
             breakdown.append(
                 CostUsageDailyReport.ModelBreakdown(
