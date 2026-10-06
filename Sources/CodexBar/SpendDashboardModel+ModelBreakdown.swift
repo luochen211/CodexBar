@@ -39,7 +39,7 @@ extension SpendDashboardModel {
             for windowEntry in summary.entries {
                 let entry = windowEntry.entry
                 let breakdowns = entry.modelBreakdowns ?? []
-                if !Self.hasCompleteModelCostCoverage(entry) {
+                if !Self.hasCompleteModelCostCoverage(input.provider, entry) {
                     completeness = .incomplete
                 }
                 for breakdown in breakdowns {
@@ -134,7 +134,7 @@ extension SpendDashboardModel {
         guard summary.input.provider == .codex else { return false }
         return summary.entries.allSatisfy { windowEntry in
             let entry = windowEntry.entry
-            return Self.hasCompleteModelCostCoverage(entry) ||
+            return Self.hasCompleteModelCostCoverage(summary.input.provider, entry) ||
                 Self.hasRetainablePartialCodexModelCostCoverage(entry)
         }
     }
@@ -167,7 +167,7 @@ extension SpendDashboardModel {
             && summary.entries.allSatisfy { windowEntry in
                 let entry = windowEntry.entry
                 return entry.hasOnlyIncompleteRequests || Self.hasRetainableUnpricedModelRows(entry) ||
-                    Self.hasCompleteModelCostCoverage(entry) ||
+                    Self.hasCompleteModelCostCoverage(summary.input.provider, entry) ||
                     Self.hasProvenZeroCost(entry) ||
                     (entry.costUSD == nil && entry.modelBreakdowns?.isEmpty == true && Self.hasProvenZeroTokens(entry))
             }
@@ -263,10 +263,12 @@ extension SpendDashboardModel {
         }
     }
 
-    private static func hasCompleteModelCostCoverage(_ entry: CostUsageDailyReport.Entry) -> Bool {
-        guard entry.incompleteRequestCount == 0,
-              (entry.unpricedRequestCount ?? 0) == 0
-        else { return false }
+    private static func hasCompleteModelCostCoverage(
+        _ provider: UsageProvider,
+        _ entry: CostUsageDailyReport.Entry) -> Bool
+    {
+        guard entry.incompleteRequestCount == 0 else { return false }
+        if provider == .codex, (entry.unpricedRequestCount ?? 0) > 0 { return false }
         var totalCost = 0.0
         var sawNamedBreakdown = false
         for breakdown in entry.modelBreakdowns ?? [] {

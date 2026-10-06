@@ -321,6 +321,33 @@ struct SpendDashboardPartialCostTests {
     }
 
     @Test
+    func `Cursor keeps a same-model priced subtotal when another request is unpriced`() throws {
+        let entry = CostUsageDailyReport.Entry(
+            date: "2026-07-15",
+            inputTokens: nil,
+            outputTokens: nil,
+            totalTokens: 70,
+            costUSD: 3,
+            modelsUsed: ["cursor-model"],
+            modelBreakdowns: [
+                .init(modelName: "cursor-model", costUSD: 3, totalTokens: 70),
+            ],
+            unpricedRequestCount: 1)
+        let snapshot = Self.snapshot(
+            entries: [entry],
+            last30DaysTokens: 70,
+            last30DaysCostUSD: 3)
+        let group = try Self.group(inputs: [
+            .init(provider: .cursor, displayName: "Cursor", snapshot: snapshot),
+        ])
+
+        #expect(group.totalCost == 3)
+        #expect(group.modelHistoryCompleteness == .complete)
+        #expect(group.models.map(\.modelName) == ["cursor-model"])
+        #expect(group.models.first?.totalCost == 3)
+    }
+
+    @Test
     func `incomplete Codex history with an unresolved day keeps spend unavailable`() throws {
         let snapshot = Self.snapshot(
             entries: [
