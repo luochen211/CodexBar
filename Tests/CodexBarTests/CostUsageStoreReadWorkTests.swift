@@ -109,9 +109,9 @@ struct CostUsageStoreReadWorkTests {
                 modelsUsed: entry.modelsUsed,
                 modelBreakdowns: entry.modelBreakdowns,
                 unpricedRequestCount: entry.unpricedRequestCount ?? 0,
-                pricedRequestCount: entry.pricedRequestCount ?? 0,
                 unmeteredRequestCount: entry.unmeteredRequestCount ?? 0,
-                estimatedRequestCount: entry.estimatedRequestCount ?? 0)
+                estimatedRequestCount: entry.estimatedRequestCount ?? 0,
+                pricedRequestCount: entry.pricedRequestCount ?? 0)
         }
     }
 
