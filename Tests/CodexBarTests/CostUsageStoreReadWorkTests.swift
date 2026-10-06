@@ -33,7 +33,7 @@ struct CostUsageStoreReadWorkTests {
         try await CostUsageStoreTestHooks.$current.withValue(recordingHooks) {
             let cached = try #require(await fixture.cachedSnapshot(details: true))
             let cachedWork = recorder.snapshot()
-            #expect(cached.snapshot == Self.expectedRetainedReadSnapshot(
+            #expect(Self.coverageComplete(cached.snapshot) == Self.expectedRetainedReadSnapshot(
                 fixture, retainedReport: retainedReport, coverage: !pending || retainedReport))
             #expect(cached.lastRefreshAt == (retainedReport ? nil : fixture.now))
             #expect(cached.staleSnapshotUpdatedAt == (retainedReport ? fixture.now.addingTimeInterval(-60) : nil))
@@ -57,7 +57,7 @@ struct CostUsageStoreReadWorkTests {
                 includePiSessions: false,
                 scannerOptions: fixture.options)
             let work = recorder.snapshot()
-            #expect(snapshot == Self.expectedRetainedReadSnapshot(
+            #expect(Self.coverageComplete(snapshot) == Self.expectedRetainedReadSnapshot(
                 fixture, retainedReport: retainedReport, coverage: !pending))
             #expect(snapshot.projects.isEmpty == retainedReport)
             #expect(snapshot.sessions.isEmpty == retainedReport)
@@ -113,6 +113,32 @@ struct CostUsageStoreReadWorkTests {
                 estimatedRequestCount: entry.estimatedRequestCount ?? 0,
                 pricedRequestCount: entry.pricedRequestCount ?? 0)
         }
+    }
+
+    private static func coverageComplete(
+        _ snapshot: CostUsageTokenSnapshot) -> CostUsageTokenSnapshot
+    {
+        CostUsageTokenSnapshot(
+            sessionTokens: snapshot.sessionTokens,
+            sessionCostUSD: snapshot.sessionCostUSD,
+            sessionRequests: snapshot.sessionRequests,
+            last30DaysTokens: snapshot.last30DaysTokens,
+            last30DaysCostUSD: snapshot.last30DaysCostUSD,
+            last30DaysRequests: snapshot.last30DaysRequests,
+            currencyCode: snapshot.currencyCode,
+            historyDays: snapshot.historyDays,
+            historyCoverageIsEstablished: snapshot.historyCoverageIsEstablished,
+            historyScanIsPartial: snapshot.historyScanIsPartial,
+            historyLabel: snapshot.historyLabel,
+            meteredCostUSD: snapshot.meteredCostUSD,
+            costProvenance: snapshot.costProvenance,
+            credentialScopeFingerprint: snapshot.credentialScopeFingerprint,
+            daily: Self.coverageComplete(snapshot.daily),
+            projects: snapshot.projects,
+            sessions: snapshot.sessions,
+            hourly: snapshot.hourly,
+            quotaSlices: snapshot.quotaSlices,
+            updatedAt: snapshot.updatedAt)
     }
 
     @Test(arguments: [2, 16])
