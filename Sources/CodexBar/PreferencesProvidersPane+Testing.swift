@@ -11,8 +11,46 @@ extension ProvidersPane {
         self.providerSubtitle(provider)
     }
 
-    func _test_menuBarMetricPicker(for provider: UsageProvider) -> ProviderSettingsPickerDescriptor? {
-        self.menuBarMetricPicker(for: provider)
+    func _test_providerSidebarSubtitle(_ provider: UsageProvider) -> String {
+        self.providerSidebarSubtitle(provider)
+    }
+
+    func _test_moveProviders(fromOffsets: IndexSet, toOffset: Int) {
+        self.moveProviders(fromOffsets: fromOffsets, toOffset: toOffset)
+    }
+
+    func _test_settingsPickers(for provider: UsageProvider) -> [ProviderSettingsPickerDescriptor] {
+        guard let impl = ProviderCatalog.implementation(for: provider) else { return [] }
+        var statusTextByID: [String: String] = [:]
+        var lastAppActiveRunAtByID: [String: Date] = [:]
+        let context = ProviderSettingsContext(
+            provider: provider,
+            settings: self.settings,
+            store: self.store,
+            statusText: { id in
+                statusTextByID[id]
+            },
+            setStatusText: { id, text in
+                if let text {
+                    statusTextByID[id] = text
+                } else {
+                    statusTextByID.removeValue(forKey: id)
+                }
+            },
+            lastAppActiveRunAt: { id in
+                lastAppActiveRunAtByID[id]
+            },
+            setLastAppActiveRunAt: { id, date in
+                if let date {
+                    lastAppActiveRunAtByID[id] = date
+                } else {
+                    lastAppActiveRunAtByID.removeValue(forKey: id)
+                }
+            },
+            requestConfirmation: { _ in },
+            runLoginFlow: {})
+        return impl.settingsPickers(context: context)
+            .filter { $0.isVisible?() ?? true }
     }
 
     func _test_tokenAccountDescriptor(for provider: UsageProvider) -> ProviderSettingsTokenAccountsDescriptor? {
@@ -20,7 +58,35 @@ extension ProvidersPane {
     }
 
     func _test_menuCardModel(for provider: UsageProvider) -> UsageMenuCardView.Model {
-        self.menuCardModel(for: provider)
+        self.store.menuCardModel(for: provider, context: .settings)
+    }
+
+    func _test_openAIWebDiagnostic(for provider: UsageProvider) -> String? {
+        self.openAIWebDiagnostic(for: provider)
+    }
+
+    func _test_providerErrorDisplay(for provider: UsageProvider) -> ProviderErrorDisplay? {
+        self.providerErrorDisplay(provider)
+    }
+
+    func _test_codexAccountsSectionState() -> CodexAccountsSectionState? {
+        self.codexAccountsSectionState(for: .codex)
+    }
+
+    func _test_selectCodexVisibleAccount(id: String) async {
+        await self.selectCodexVisibleAccount(id: id)
+    }
+
+    func _test_addManagedCodexAccount() async {
+        await self.addManagedCodexAccount()
+    }
+
+    func _test_reauthenticateCodexAccount(_ account: CodexVisibleAccount) async {
+        await self.reauthenticateCodexAccount(account)
+    }
+
+    func _test_requestCodexSystemVisibleAccount(id: String) async {
+        await self.requestCodexSystemVisibleAccount(id: id)
     }
 }
 
@@ -52,6 +118,7 @@ enum ProvidersPaneTestHarness {
         settings.claudeCookieSource = .manual
         settings.cursorCookieSource = .manual
         settings.opencodeCookieSource = .manual
+        settings.opencodegoCookieSource = .manual
         settings.factoryCookieSource = .manual
         settings.minimaxCookieSource = .manual
         settings.augmentCookieSource = .manual
@@ -63,15 +130,12 @@ enum ProvidersPaneTestHarness {
         _ = pane._test_providerSubtitle(.claude)
         _ = pane._test_providerSubtitle(.cursor)
         _ = pane._test_providerSubtitle(.opencode)
+        _ = pane._test_providerSubtitle(.opencodego)
         _ = pane._test_providerSubtitle(.zai)
         _ = pane._test_providerSubtitle(.synthetic)
         _ = pane._test_providerSubtitle(.minimax)
         _ = pane._test_providerSubtitle(.kimi)
         _ = pane._test_providerSubtitle(.gemini)
-
-        _ = pane._test_menuBarMetricPicker(for: .codex)
-        _ = pane._test_menuBarMetricPicker(for: .gemini)
-        _ = pane._test_menuBarMetricPicker(for: .zai)
 
         if let descriptor = pane._test_tokenAccountDescriptor(for: .claude) {
             _ = descriptor.isVisible?()
@@ -93,6 +157,7 @@ enum ProvidersPaneTestHarness {
             isEnabled: enabledBinding,
             subtitle: "Subtitle",
             model: model,
+            openAIWebDiagnostic: pane._test_openAIWebDiagnostic(for: .codex),
             settingsPickers: [descriptors.picker],
             settingsToggles: [descriptors.toggle],
             settingsFields: [descriptors.fieldPlain, descriptors.fieldSecure],
@@ -100,7 +165,13 @@ enum ProvidersPaneTestHarness {
             errorDisplay: ProviderErrorDisplay(preview: "Preview", full: "Full"),
             isErrorExpanded: expandedBinding,
             onCopyError: { _ in },
-            onRefresh: {}).body
+            onRefresh: {},
+            showsSupplementarySettingsContent: true,
+            supplementarySettingsContent: {
+                Section("Accounts") {
+                    Text("Supplementary")
+                }
+            }).body
     }
 
     private static func makeDescriptors() -> ProviderListTestDescriptors {
@@ -149,8 +220,7 @@ enum ProvidersPaneTestHarness {
             placeholder: "Placeholder",
             binding: Binding(get: { "" }, set: { _ in }),
             actions: [actionBordered],
-            isVisible: { true },
-            onActivate: nil)
+            isVisible: { true })
         let fieldSecure = ProviderSettingsFieldDescriptor(
             id: "secure",
             title: "Secure",
@@ -159,8 +229,7 @@ enum ProvidersPaneTestHarness {
             placeholder: "Secure",
             binding: Binding(get: { "" }, set: { _ in }),
             actions: [actionLink],
-            isVisible: { true },
-            onActivate: nil)
+            isVisible: { true })
         let tokenAccountsEmpty = ProviderSettingsTokenAccountsDescriptor(
             id: "accounts-empty",
             title: "Accounts",
@@ -171,8 +240,13 @@ enum ProvidersPaneTestHarness {
             accounts: { [] },
             activeIndex: { 0 },
             setActiveIndex: { _ in },
-            addAccount: { _, _ in },
+            showsOrganizationField: false,
+            showsTeamModeControls: false,
+            addAccount: { _, _, _, _, _ in },
+            updateAccount: { _, _, _, _ in },
             removeAccount: { _ in },
+            primaryAddActionTitle: nil,
+            primaryAddAction: nil,
             openConfigFile: {},
             reloadFromDisk: {})
 

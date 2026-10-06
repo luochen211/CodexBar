@@ -1,254 +1,204 @@
 import Foundation
 
+/// Associates one provider instance with its concrete runtime settings payload.
+public protocol ProviderSettingsSectionKey: Sendable {
+    associatedtype Section: Sendable
+
+    static var providerID: ProviderInstanceID { get }
+}
+
 public struct ProviderSettingsSnapshot: Sendable {
-    public static func make(
-        debugMenuEnabled: Bool = false,
-        debugKeepCLISessionsAlive: Bool = false,
-        codex: CodexProviderSettings? = nil,
-        claude: ClaudeProviderSettings? = nil,
-        cursor: CursorProviderSettings? = nil,
-        opencode: OpenCodeProviderSettings? = nil,
-        factory: FactoryProviderSettings? = nil,
-        minimax: MiniMaxProviderSettings? = nil,
-        zai: ZaiProviderSettings? = nil,
-        copilot: CopilotProviderSettings? = nil,
-        kimi: KimiProviderSettings? = nil,
-        augment: AugmentProviderSettings? = nil,
-        amp: AmpProviderSettings? = nil,
-        jetbrains: JetBrainsProviderSettings? = nil) -> ProviderSettingsSnapshot
-    {
-        ProviderSettingsSnapshot(
-            debugMenuEnabled: debugMenuEnabled,
-            debugKeepCLISessionsAlive: debugKeepCLISessionsAlive,
-            codex: codex,
-            claude: claude,
-            cursor: cursor,
-            opencode: opencode,
-            factory: factory,
-            minimax: minimax,
-            zai: zai,
-            copilot: copilot,
-            kimi: kimi,
-            augment: augment,
-            amp: amp,
-            jetbrains: jetbrains)
-    }
-
-    public struct CodexProviderSettings: Sendable {
-        public let usageDataSource: CodexUsageDataSource
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(
-            usageDataSource: CodexUsageDataSource,
-            cookieSource: ProviderCookieSource,
-            manualCookieHeader: String?)
-        {
-            self.usageDataSource = usageDataSource
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct ClaudeProviderSettings: Sendable {
-        public let usageDataSource: ClaudeUsageDataSource
-        public let webExtrasEnabled: Bool
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(
-            usageDataSource: ClaudeUsageDataSource,
-            webExtrasEnabled: Bool,
-            cookieSource: ProviderCookieSource,
-            manualCookieHeader: String?)
-        {
-            self.usageDataSource = usageDataSource
-            self.webExtrasEnabled = webExtrasEnabled
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct CursorProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct OpenCodeProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-        public let workspaceID: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?, workspaceID: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-            self.workspaceID = workspaceID
-        }
-    }
-
-    public struct FactoryProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct MiniMaxProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-        public let apiRegion: MiniMaxAPIRegion
-
-        public init(
-            cookieSource: ProviderCookieSource,
-            manualCookieHeader: String?,
-            apiRegion: MiniMaxAPIRegion = .global)
-        {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-            self.apiRegion = apiRegion
-        }
-    }
-
-    public struct ZaiProviderSettings: Sendable {
-        public let apiRegion: ZaiAPIRegion
-
-        public init(apiRegion: ZaiAPIRegion = .global) {
-            self.apiRegion = apiRegion
-        }
-    }
-
-    public struct CopilotProviderSettings: Sendable {
-        public init() {}
-    }
-
-    public struct KimiProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct AugmentProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
-
-    public struct JetBrainsProviderSettings: Sendable {
-        public let ideBasePath: String?
-
-        public init(ideBasePath: String?) {
-            self.ideBasePath = ideBasePath
-        }
-    }
-
-    public struct AmpProviderSettings: Sendable {
-        public let cookieSource: ProviderCookieSource
-        public let manualCookieHeader: String?
-
-        public init(cookieSource: ProviderCookieSource, manualCookieHeader: String?) {
-            self.cookieSource = cookieSource
-            self.manualCookieHeader = manualCookieHeader
-        }
-    }
+    private let sections: [ProviderInstanceID: any Sendable]
 
     public let debugMenuEnabled: Bool
     public let debugKeepCLISessionsAlive: Bool
-    public let codex: CodexProviderSettings?
-    public let claude: ClaudeProviderSettings?
-    public let cursor: CursorProviderSettings?
-    public let opencode: OpenCodeProviderSettings?
-    public let factory: FactoryProviderSettings?
-    public let minimax: MiniMaxProviderSettings?
-    public let zai: ZaiProviderSettings?
-    public let copilot: CopilotProviderSettings?
-    public let kimi: KimiProviderSettings?
-    public let augment: AugmentProviderSettings?
-    public let amp: AmpProviderSettings?
-    public let jetbrains: JetBrainsProviderSettings?
-
-    public var jetbrainsIDEBasePath: String? {
-        self.jetbrains?.ideBasePath
-    }
 
     public init(
-        debugMenuEnabled: Bool,
-        debugKeepCLISessionsAlive: Bool,
-        codex: CodexProviderSettings?,
-        claude: ClaudeProviderSettings?,
-        cursor: CursorProviderSettings?,
-        opencode: OpenCodeProviderSettings?,
-        factory: FactoryProviderSettings?,
-        minimax: MiniMaxProviderSettings?,
-        zai: ZaiProviderSettings?,
-        copilot: CopilotProviderSettings?,
-        kimi: KimiProviderSettings?,
-        augment: AugmentProviderSettings?,
-        amp: AmpProviderSettings?,
-        jetbrains: JetBrainsProviderSettings? = nil)
+        debugMenuEnabled: Bool = false,
+        debugKeepCLISessionsAlive: Bool = false,
+        contributions: [ProviderSettingsSnapshotContribution] = [])
     {
         self.debugMenuEnabled = debugMenuEnabled
         self.debugKeepCLISessionsAlive = debugKeepCLISessionsAlive
-        self.codex = codex
-        self.claude = claude
-        self.cursor = cursor
-        self.opencode = opencode
-        self.factory = factory
-        self.minimax = minimax
-        self.zai = zai
-        self.copilot = copilot
-        self.kimi = kimi
-        self.augment = augment
-        self.amp = amp
-        self.jetbrains = jetbrains
+        self.sections = Dictionary(
+            contributions.map { ($0.providerID, $0.section) },
+            uniquingKeysWith: { _, new in new })
+    }
+
+    public init<Key: ProviderSettingsSectionKey>(
+        _ section: Key.Section,
+        for key: Key.Type,
+        debugMenuEnabled: Bool = false,
+        debugKeepCLISessionsAlive: Bool = false)
+    {
+        self.init(
+            debugMenuEnabled: debugMenuEnabled,
+            debugKeepCLISessionsAlive: debugKeepCLISessionsAlive,
+            contributions: [ProviderSettingsSnapshotContribution(section, for: key)])
+    }
+
+    public static func make<Key: ProviderSettingsSectionKey>(
+        _ section: Key.Section?,
+        for key: Key.Type) -> ProviderSettingsSnapshot
+    {
+        guard let section else { return ProviderSettingsSnapshot() }
+        return ProviderSettingsSnapshot(section, for: key)
+    }
+
+    public static func make() -> ProviderSettingsSnapshot {
+        ProviderSettingsSnapshot()
+    }
+
+    public subscript<Key: ProviderSettingsSectionKey>(key: Key.Type) -> Key.Section? {
+        self.sections[key.providerID] as? Key.Section
+    }
+
+    func contains(_ registration: ProviderSettingsSectionRegistration) -> Bool {
+        guard let section = self.sections[registration.providerID] else { return false }
+        return ObjectIdentifier(type(of: section)) == registration.sectionTypeID
     }
 }
 
-public enum ProviderSettingsSnapshotContribution: Sendable {
-    case codex(ProviderSettingsSnapshot.CodexProviderSettings)
-    case claude(ProviderSettingsSnapshot.ClaudeProviderSettings)
-    case cursor(ProviderSettingsSnapshot.CursorProviderSettings)
-    case opencode(ProviderSettingsSnapshot.OpenCodeProviderSettings)
-    case factory(ProviderSettingsSnapshot.FactoryProviderSettings)
-    case minimax(ProviderSettingsSnapshot.MiniMaxProviderSettings)
-    case zai(ProviderSettingsSnapshot.ZaiProviderSettings)
-    case copilot(ProviderSettingsSnapshot.CopilotProviderSettings)
-    case kimi(ProviderSettingsSnapshot.KimiProviderSettings)
-    case augment(ProviderSettingsSnapshot.AugmentProviderSettings)
-    case amp(ProviderSettingsSnapshot.AmpProviderSettings)
-    case jetbrains(ProviderSettingsSnapshot.JetBrainsProviderSettings)
+public struct ProviderSettingsSnapshotContribution: Sendable {
+    public let providerID: ProviderInstanceID
+    let section: any Sendable
+    let sectionTypeID: ObjectIdentifier
+
+    public init<Key: ProviderSettingsSectionKey>(_ section: Key.Section, for key: Key.Type) {
+        self.providerID = key.providerID
+        self.section = section
+        self.sectionTypeID = ObjectIdentifier(Key.Section.self)
+    }
+
+    init(providerID: ProviderInstanceID, section: some Sendable) {
+        self.providerID = providerID
+        self.section = section
+        self.sectionTypeID = ObjectIdentifier(type(of: section))
+    }
+}
+
+public struct ProviderSettingsSectionRegistration: Sendable {
+    public let providerID: ProviderInstanceID
+    let sectionTypeID: ObjectIdentifier
+    public let defaultContribution: ProviderSettingsSnapshotContribution?
+    /// Preserves the registered section type after the caller resolves runtime-specific cookie policy.
+    public private(set) var cookieContribution: (@Sendable (
+        CookieProviderSettings) -> ProviderSettingsSnapshotContribution)?
+    private let cookieSettingsReader: @Sendable (ProviderSettingsSnapshot) -> CookieProviderSettings?
+    private let credentialContributionReader: @Sendable (
+        ProviderCredentialSettingsContext) -> ProviderSettingsSnapshotContribution?
+
+    public init<Key: ProviderSettingsSectionKey>(_ key: Key.Type) {
+        self.providerID = key.providerID
+        self.sectionTypeID = ObjectIdentifier(Key.Section.self)
+        self.defaultContribution = nil
+        self.cookieSettingsReader = { _ in nil }
+        self.credentialContributionReader = { _ in nil }
+    }
+
+    public init<Key: ProviderSettingsSectionKey>(
+        _ key: Key.Type,
+        cookieSettings: @escaping @Sendable (Key.Section) -> CookieProviderSettings?,
+        credentialSettings: @escaping @Sendable (ProviderCredentialSettingsContext) -> Key.Section? = { _ in nil })
+    {
+        self.providerID = key.providerID
+        self.sectionTypeID = ObjectIdentifier(Key.Section.self)
+        self.defaultContribution = nil
+        self.cookieSettingsReader = { snapshot in
+            snapshot[key].flatMap(cookieSettings)
+        }
+        self.credentialContributionReader = { context in
+            credentialSettings(context).map { ProviderSettingsSnapshotContribution($0, for: key) }
+        }
+    }
+
+    public init<Key: ProviderSettingsSectionKey>(
+        _ key: Key.Type,
+        credentialSettings: @escaping @Sendable (ProviderCredentialSettingsContext) -> Key.Section?)
+    {
+        self.init(key, cookieSettings: { _ in nil }, credentialSettings: credentialSettings)
+    }
+
+    public init<Key: ProviderSettingsSectionKey>(
+        _ key: Key.Type,
+        cookieSettings _: Key.Section.Type) where Key.Section: ProviderCookieSettings
+    {
+        self.init(
+            key,
+            cookieSettings: { settings in
+                CookieProviderSettings(
+                    cookieSource: settings.cookieSource,
+                    manualCookieHeader: settings.manualCookieHeader,
+                    manualCookieOrigin: settings.manualCookieOrigin)
+            },
+            credentialSettings: { context in
+                guard let provider = key.providerID.firstPartyProvider else { return nil }
+                let settings = context.cookieSettings(for: provider)
+                return Key.Section(
+                    cookieSource: settings.cookieSource,
+                    manualCookieHeader: settings.manualCookieHeader,
+                    manualCookieOrigin: settings.manualCookieOrigin)
+            })
+        self.cookieContribution = { settings in
+            ProviderSettingsSnapshotContribution(
+                Key.Section(
+                    cookieSource: settings.cookieSource,
+                    manualCookieHeader: settings.manualCookieHeader,
+                    manualCookieOrigin: settings.manualCookieOrigin),
+                for: key)
+        }
+    }
+
+    static func empty(for providerID: ProviderInstanceID) -> Self {
+        let contribution = ProviderSettingsSnapshotContribution(
+            providerID: providerID,
+            section: EmptyProviderSettingsSection())
+        return Self(
+            providerID: providerID,
+            sectionTypeID: contribution.sectionTypeID,
+            defaultContribution: contribution,
+            cookieSettingsReader: { _ in nil },
+            credentialContributionReader: { _ in nil })
+    }
+
+    private init(
+        providerID: ProviderInstanceID,
+        sectionTypeID: ObjectIdentifier,
+        defaultContribution: ProviderSettingsSnapshotContribution?,
+        cookieSettingsReader: @escaping @Sendable (ProviderSettingsSnapshot) -> CookieProviderSettings?,
+        credentialContributionReader: @escaping @Sendable (
+            ProviderCredentialSettingsContext) -> ProviderSettingsSnapshotContribution?)
+    {
+        self.providerID = providerID
+        self.sectionTypeID = sectionTypeID
+        self.defaultContribution = defaultContribution
+        self.cookieSettingsReader = cookieSettingsReader
+        self.credentialContributionReader = credentialContributionReader
+    }
+
+    public func accepts(_ contribution: ProviderSettingsSnapshotContribution) -> Bool {
+        contribution.providerID == self.providerID && contribution.sectionTypeID == self.sectionTypeID
+    }
+
+    public func canRead(from snapshot: ProviderSettingsSnapshot) -> Bool {
+        snapshot.contains(self)
+    }
+
+    public func cookieSettings(from snapshot: ProviderSettingsSnapshot) -> CookieProviderSettings? {
+        self.cookieSettingsReader(snapshot)
+    }
+
+    public func credentialContribution(
+        context: ProviderCredentialSettingsContext) -> ProviderSettingsSnapshotContribution?
+    {
+        self.credentialContributionReader(context)
+    }
 }
 
 public struct ProviderSettingsSnapshotBuilder: Sendable {
     public var debugMenuEnabled: Bool
     public var debugKeepCLISessionsAlive: Bool
-    public var codex: ProviderSettingsSnapshot.CodexProviderSettings?
-    public var claude: ProviderSettingsSnapshot.ClaudeProviderSettings?
-    public var cursor: ProviderSettingsSnapshot.CursorProviderSettings?
-    public var opencode: ProviderSettingsSnapshot.OpenCodeProviderSettings?
-    public var factory: ProviderSettingsSnapshot.FactoryProviderSettings?
-    public var minimax: ProviderSettingsSnapshot.MiniMaxProviderSettings?
-    public var zai: ProviderSettingsSnapshot.ZaiProviderSettings?
-    public var copilot: ProviderSettingsSnapshot.CopilotProviderSettings?
-    public var kimi: ProviderSettingsSnapshot.KimiProviderSettings?
-    public var augment: ProviderSettingsSnapshot.AugmentProviderSettings?
-    public var amp: ProviderSettingsSnapshot.AmpProviderSettings?
-    public var jetbrains: ProviderSettingsSnapshot.JetBrainsProviderSettings?
+    private var contributions: [ProviderSettingsSnapshotContribution] = []
 
     public init(debugMenuEnabled: Bool = false, debugKeepCLISessionsAlive: Bool = false) {
         self.debugMenuEnabled = debugMenuEnabled
@@ -256,37 +206,15 @@ public struct ProviderSettingsSnapshotBuilder: Sendable {
     }
 
     public mutating func apply(_ contribution: ProviderSettingsSnapshotContribution) {
-        switch contribution {
-        case let .codex(value): self.codex = value
-        case let .claude(value): self.claude = value
-        case let .cursor(value): self.cursor = value
-        case let .opencode(value): self.opencode = value
-        case let .factory(value): self.factory = value
-        case let .minimax(value): self.minimax = value
-        case let .zai(value): self.zai = value
-        case let .copilot(value): self.copilot = value
-        case let .kimi(value): self.kimi = value
-        case let .augment(value): self.augment = value
-        case let .amp(value): self.amp = value
-        case let .jetbrains(value): self.jetbrains = value
-        }
+        self.contributions.append(contribution)
     }
 
     public func build() -> ProviderSettingsSnapshot {
         ProviderSettingsSnapshot(
             debugMenuEnabled: self.debugMenuEnabled,
             debugKeepCLISessionsAlive: self.debugKeepCLISessionsAlive,
-            codex: self.codex,
-            claude: self.claude,
-            cursor: self.cursor,
-            opencode: self.opencode,
-            factory: self.factory,
-            minimax: self.minimax,
-            zai: self.zai,
-            copilot: self.copilot,
-            kimi: self.kimi,
-            augment: self.augment,
-            amp: self.amp,
-            jetbrains: self.jetbrains)
+            contributions: self.contributions)
     }
 }
+
+private struct EmptyProviderSettingsSection: Sendable {}

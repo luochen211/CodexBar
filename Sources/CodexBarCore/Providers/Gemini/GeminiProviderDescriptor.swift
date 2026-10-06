@@ -1,19 +1,20 @@
-import CodexBarMacroSupport
 import Foundation
 
-@ProviderDescriptorRegistration
-@ProviderDescriptorDefinition
 public enum GeminiProviderDescriptor {
+    public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
             id: .gemini,
+            menuBarMetrics: ProviderMenuBarMetricCapabilities(
+                supported: [.automatic, .primary, .secondary, .average]),
             metadata: ProviderMetadata(
                 id: .gemini,
                 displayName: "Gemini",
                 sessionLabel: "Pro",
                 weeklyLabel: "Flash",
-                opusLabel: nil,
-                supportsOpus: false,
+                opusLabel: "Flash Lite",
+                supportsOpus: true,
                 supportsCredits: false,
                 creditsHint: "",
                 toggleTitle: "Show Gemini usage",
@@ -21,27 +22,52 @@ public enum GeminiProviderDescriptor {
                 defaultEnabled: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
+                sharePlanLabels: [
+                    "free": "Free", "paid": "Paid", "plus": "Plus", "workspace": "Workspace",
+                    "legacy": "Legacy", "gemini code assist in google one ai pro": "Google One AI Pro",
+                ],
+                debugLogUnavailableMessage: "Gemini debug log not yet implemented",
+                debugPane: ProviderDebugPaneCapabilities(errorSimulationOrder: 2),
                 dashboardURL: "https://gemini.google.com",
+                changelogURL: "https://github.com/google-gemini/gemini-cli/releases",
                 statusPageURL: nil,
                 statusLinkURL: "https://www.google.com/appsstatus/dashboard/products/npdyhgECDJ6tB66MxXyo/history",
                 statusWorkspaceProductID: "npdyhgECDJ6tB66MxXyo"),
             branding: ProviderBranding(
-                iconStyle: .gemini,
+                iconStyle: .init(provider: .gemini),
                 iconResourceName: "ProviderIcon-gemini",
-                color: ProviderColor(red: 171 / 255, green: 135 / 255, blue: 234 / 255)),
+                color: ProviderColor(red: 171 / 255, green: 135 / 255, blue: 234 / 255),
+                confettiPalette: [
+                    ProviderColor(hex: 0x4285F4),
+                    ProviderColor(hex: 0xA142F4),
+                    ProviderColor(hex: 0xD96570),
+                ],
+                burnDownWidgetColor: ProviderColor(red: 0.420, green: 0.440, blue: 0.900)),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Gemini cost summary is not supported." }),
+            presentation: ProviderUsagePresentation(
+                identityPresenter: { provider, snapshot in
+                    guard let plan = snapshot.loginMethod(for: provider), !plan.isEmpty else {
+                        return ProviderIdentityPresentation(badge: nil, plan: nil)
+                    }
+                    let display = UsageFormatter.cleanPlanName(plan)
+                    return ProviderIdentityPresentation(badge: display, plan: display)
+                },
+                iconDecorations: [.gemini]),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .api],
                 pipeline: ProviderFetchPipeline(resolveStrategies: { _ in [GeminiStatusFetchStrategy()] })),
             cli: ProviderCLIConfig(
                 name: "gemini",
+                binaryLocator: { BinaryLocator.resolveGeminiBinary(env: $0) },
                 versionDetector: { _ in ProviderVersionDetector.geminiVersion() }))
     }
 }
 
 struct GeminiStatusFetchStrategy: ProviderFetchStrategy {
+    static let sourceLabel = "oauth-api"
+
     let id: String = "gemini.api"
     let kind: ProviderFetchKind = .apiToken
 
@@ -54,7 +80,7 @@ struct GeminiStatusFetchStrategy: ProviderFetchStrategy {
         let snap = try await probe.fetch()
         return self.makeResult(
             usage: snap.toUsageSnapshot(),
-            sourceLabel: "api")
+            sourceLabel: Self.sourceLabel)
     }
 
     func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool {

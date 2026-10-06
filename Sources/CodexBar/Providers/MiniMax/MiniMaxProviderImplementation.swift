@@ -1,10 +1,6 @@
-import AppKit
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
-import SwiftUI
 
-@ProviderImplementationRegistration
 struct MiniMaxProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .minimax
 
@@ -31,9 +27,12 @@ struct MiniMaxProviderImplementation: ProviderImplementation {
     @MainActor
     func tokenAccountsVisibility(context: ProviderSettingsContext, support: TokenAccountSupport) -> Bool {
         guard support.requiresManualCookieSource else { return true }
-        if !context.settings.tokenAccounts(for: context.provider).isEmpty { return true }
-        context.settings.ensureMiniMaxAPITokenLoaded()
-        if context.settings.minimaxAuthMode().usesAPIToken { return false }
+        if !context.settings.tokenAccounts(for: context.provider).isEmpty {
+            return true
+        }
+        if context.settings.minimaxAuthMode().usesAPIToken {
+            return false
+        }
         return context.settings.minimaxCookieSource == .manual
     }
 
@@ -46,52 +45,31 @@ struct MiniMaxProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
-        context.settings.ensureMiniMaxAPITokenLoaded()
         let authMode: () -> MiniMaxAuthMode = {
             context.settings.minimaxAuthMode()
         }
 
-        let cookieBinding = Binding(
-            get: { context.settings.minimaxCookieSource.rawValue },
-            set: { raw in
-                context.settings.minimaxCookieSource = ProviderCookieSource(rawValue: raw) ?? .auto
-            })
-        let cookieOptions = ProviderCookieSourceUI.options(
-            allowsOff: false,
-            keychainDisabled: context.settings.debugDisableKeychainAccess)
-
-        let cookieSubtitle: () -> String? = {
-            ProviderCookieSourceUI.subtitle(
-                source: context.settings.minimaxCookieSource,
-                keychainDisabled: context.settings.debugDisableKeychainAccess,
-                auto: "Automatic imports browser cookies and local storage tokens.",
-                manual: "Paste a Cookie header or cURL capture from the Coding Plan page.",
-                off: "MiniMax cookies are disabled.")
-        }
-
-        let regionBinding = Binding(
-            get: { context.settings.minimaxAPIRegion.rawValue },
-            set: { raw in
-                context.settings.minimaxAPIRegion = MiniMaxAPIRegion(rawValue: raw) ?? .global
-            })
+        let regionBinding = context.rawValueBinding(\.minimaxAPIRegion, fallback: .global)
         let regionOptions = MiniMaxAPIRegion.allCases.map {
             ProviderSettingsPickerOption(id: $0.rawValue, title: $0.displayName)
         }
 
         return [
-            ProviderSettingsPickerDescriptor(
+            ProviderCookieSourceUI.picker(
                 id: "minimax-cookie-source",
-                title: "Cookie source",
-                subtitle: "Automatic imports browser cookies and local storage tokens.",
-                dynamicSubtitle: cookieSubtitle,
-                binding: cookieBinding,
-                options: cookieOptions,
+                context: context,
+                source: \.minimaxCookieSource,
+                allowsOff: false,
+                subtitles: {
+                    .init(
+                        auto: L("Automatic imports browser cookies and local storage tokens."),
+                        manual: L("Paste a Cookie header or cURL capture from %@.", "the Token Plan page"),
+                        off: L("%@ cookies are disabled.", "MiniMax"))
+                },
                 isVisible: { authMode().allowsCookies },
                 onChange: nil,
                 trailingText: {
-                    guard let entry = CookieHeaderCache.load(provider: .minimax) else { return nil }
-                    let when = entry.storedAt.relativeDescription()
-                    return "Cached: \(entry.sourceLabel) • \(when)"
+                    ProviderCookieSourceUI.cachedTrailingText(provider: .minimax)
                 }),
             ProviderSettingsPickerDescriptor(
                 id: "minimax-region",
@@ -99,14 +77,13 @@ struct MiniMaxProviderImplementation: ProviderImplementation {
                 subtitle: "Choose the MiniMax host (global .io or China mainland .com).",
                 binding: regionBinding,
                 options: regionOptions,
-                isVisible: { authMode().allowsCookies },
+                isVisible: nil,
                 onChange: nil),
         ]
     }
 
     @MainActor
     func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
-        context.settings.ensureMiniMaxAPITokenLoaded()
         let authMode: () -> MiniMaxAuthMode = {
             context.settings.minimaxAuthMode()
         }
@@ -118,48 +95,30 @@ struct MiniMaxProviderImplementation: ProviderImplementation {
                 subtitle: "Stored in ~/.codexbar/config.json. Paste your MiniMax API key.",
                 kind: .secure,
                 placeholder: "Paste API token…",
-                binding: context.stringBinding(\.minimaxAPIToken),
+                binding: context.binding(\.minimaxAPIToken),
                 actions: [
-                    ProviderSettingsActionDescriptor(
+                    ProviderSettingsActionDescriptor.openURL(
                         id: "minimax-open-dashboard",
-                        title: "Open Coding Plan",
-                        style: .link,
-                        isVisible: nil,
-                        perform: {
-                            if let url = URL(
-                                string: "https://platform.minimax.io/user-center/payment/coding-plan?cycle_type=3")
-                            {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }),
+                        title: "Open Token Plan",
+                        url: context.settings.minimaxAPIRegion.codingPlanURL),
                 ],
-                isVisible: nil,
-                onActivate: { context.settings.ensureMiniMaxAPITokenLoaded() }),
+                isVisible: nil),
             ProviderSettingsFieldDescriptor(
                 id: "minimax-cookie",
                 title: "Cookie header",
                 subtitle: "",
                 kind: .secure,
                 placeholder: "Cookie: …",
-                binding: context.stringBinding(\.minimaxCookieHeader),
+                binding: context.binding(\.minimaxCookieHeader),
                 actions: [
-                    ProviderSettingsActionDescriptor(
+                    ProviderSettingsActionDescriptor.openURL(
                         id: "minimax-open-dashboard-cookie",
-                        title: "Open Coding Plan",
-                        style: .link,
-                        isVisible: nil,
-                        perform: {
-                            if let url = URL(
-                                string: "https://platform.minimax.io/user-center/payment/coding-plan?cycle_type=3")
-                            {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }),
+                        title: "Open Token Plan",
+                        url: context.settings.minimaxAPIRegion.codingPlanURL),
                 ],
                 isVisible: {
                     authMode().allowsCookies && context.settings.minimaxCookieSource == .manual
-                },
-                onActivate: { context.settings.ensureMiniMaxCookieLoaded() }),
+                }),
         ]
     }
 }

@@ -2,62 +2,40 @@ import CodexBarCore
 import Foundation
 
 extension SettingsStore {
-    var factoryCookieHeader: String {
-        get { self.configSnapshot.providerConfig(for: .factory)?.sanitizedCookieHeader ?? "" }
-        set {
-            self.updateProviderConfig(provider: .factory) { entry in
-                entry.cookieHeader = self.normalizedConfigValue(newValue)
+    var factoryUsageDataSource: ProviderSourceMode {
+        get {
+            switch self.configSnapshot.providerConfig(for: .factory)?.source {
+            case .api: .api
+            case .web: .web
+            case .auto, .cli, .oauth, .none: .auto
             }
-            self.logSecretUpdate(provider: .factory, field: "cookieHeader", value: newValue)
         }
+        set {
+            let source: ProviderSourceMode? = switch newValue {
+            case .auto: .auto
+            case .api: .api
+            case .web: .web
+            case .cli, .oauth: .auto
+            }
+            self.updateProviderConfig(provider: .factory) { entry in
+                entry.source = source
+            }
+            self.logProviderModeChange(provider: .factory, field: "usageSource", value: newValue.rawValue)
+        }
+    }
+
+    var factoryAPIKey: String {
+        get { self[providerConfig: .factory, field: .apiKey] }
+        set { self[providerConfig: .factory, field: .apiKey] = newValue }
+    }
+
+    var factoryCookieHeader: String {
+        get { self[providerConfig: .factory, field: .cookieHeader] }
+        set { self[providerConfig: .factory, field: .cookieHeader] = newValue }
     }
 
     var factoryCookieSource: ProviderCookieSource {
         get { self.resolvedCookieSource(provider: .factory, fallback: .auto) }
-        set {
-            self.updateProviderConfig(provider: .factory) { entry in
-                entry.cookieSource = newValue
-            }
-            self.logProviderModeChange(provider: .factory, field: "cookieSource", value: newValue.rawValue)
-        }
-    }
-
-    func ensureFactoryCookieLoaded() {}
-}
-
-extension SettingsStore {
-    func factorySettingsSnapshot(tokenOverride: TokenAccountOverride?) -> ProviderSettingsSnapshot
-    .FactoryProviderSettings {
-        ProviderSettingsSnapshot.FactoryProviderSettings(
-            cookieSource: self.factorySnapshotCookieSource(tokenOverride: tokenOverride),
-            manualCookieHeader: self.factorySnapshotCookieHeader(tokenOverride: tokenOverride))
-    }
-
-    private func factorySnapshotCookieHeader(tokenOverride: TokenAccountOverride?) -> String {
-        let fallback = self.factoryCookieHeader
-        guard let support = TokenAccountSupportCatalog.support(for: .factory),
-              case .cookieHeader = support.injection
-        else {
-            return fallback
-        }
-        guard let account = ProviderTokenAccountSelection.selectedAccount(
-            provider: .factory,
-            settings: self,
-            override: tokenOverride)
-        else {
-            return fallback
-        }
-        return TokenAccountSupportCatalog.normalizedCookieHeader(account.token, support: support)
-    }
-
-    private func factorySnapshotCookieSource(tokenOverride: TokenAccountOverride?) -> ProviderCookieSource {
-        let fallback = self.factoryCookieSource
-        guard let support = TokenAccountSupportCatalog.support(for: .factory),
-              support.requiresManualCookieSource
-        else {
-            return fallback
-        }
-        if self.tokenAccounts(for: .factory).isEmpty { return fallback }
-        return .manual
+        set { self.setCookieSource(newValue, provider: .factory) }
     }
 }

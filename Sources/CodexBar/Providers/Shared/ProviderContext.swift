@@ -11,7 +11,7 @@ struct ProviderPresentationContext {
 struct ProviderAvailabilityContext {
     let provider: UsageProvider
     let settings: SettingsStore
-    let environment: [String: String]
+    @ProcessEnvironment private(set) var environment: [String: String]
 }
 
 struct ProviderSourceLabelContext {
@@ -34,4 +34,15 @@ struct ProviderVersionContext {
 struct ProviderSettingsSnapshotContext {
     let settings: SettingsStore
     let tokenOverride: TokenAccountOverride?
+    let codexActiveSourceOverride: CodexActiveSource?
+
+    init(
+        settings: SettingsStore,
+        tokenOverride: TokenAccountOverride?,
+        codexActiveSourceOverride: CodexActiveSource? = nil)
+    {
+        self.settings = settings
+        self.tokenOverride = tokenOverride
+        self.codexActiveSourceOverride = codexActiveSourceOverride
+    }
 }

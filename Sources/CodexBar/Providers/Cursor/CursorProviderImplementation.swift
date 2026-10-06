@@ -1,9 +1,6 @@
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
-import SwiftUI
 
-@ProviderImplementationRegistration
 struct CursorProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .cursor
     let supportsLoginFlow: Bool = true
@@ -11,17 +8,6 @@ struct CursorProviderImplementation: ProviderImplementation {
     @MainActor
     func presentation(context _: ProviderPresentationContext) -> ProviderPresentation {
         ProviderPresentation { _ in "web" }
-    }
-
-    @MainActor
-    func observeSettings(_ settings: SettingsStore) {
-        _ = settings.cursorCookieSource
-        _ = settings.cursorCookieHeader
-    }
-
-    @MainActor
-    func settingsSnapshot(context: ProviderSettingsSnapshotContext) -> ProviderSettingsSnapshotContribution? {
-        .cursor(context.settings.cursorSettingsSnapshot(tokenOverride: context.tokenOverride))
     }
 
     @MainActor
@@ -40,63 +26,47 @@ struct CursorProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
-        let cookieBinding = Binding(
-            get: { context.settings.cursorCookieSource.rawValue },
-            set: { raw in
-                context.settings.cursorCookieSource = ProviderCookieSource(rawValue: raw) ?? .auto
-            })
-        let cookieOptions = ProviderCookieSourceUI.options(
-            allowsOff: false,
-            keychainDisabled: context.settings.debugDisableKeychainAccess)
-
-        let cookieSubtitle: () -> String? = {
-            ProviderCookieSourceUI.subtitle(
-                source: context.settings.cursorCookieSource,
-                keychainDisabled: context.settings.debugDisableKeychainAccess,
-                auto: "Automatic imports browser cookies or stored sessions.",
-                manual: "Paste a Cookie header from a cursor.com request.",
-                off: "Cursor cookies are disabled.")
-        }
-
-        return [
-            ProviderSettingsPickerDescriptor(
+        [
+            ProviderCookieSourceUI.picker(
                 id: "cursor-cookie-source",
-                title: "Cookie source",
-                subtitle: "Automatic imports browser cookies or stored sessions.",
-                dynamicSubtitle: cookieSubtitle,
-                binding: cookieBinding,
-                options: cookieOptions,
-                isVisible: nil,
-                onChange: nil,
+                context: context,
+                source: \.cursorCookieSource,
+                allowsOff: false,
+                subtitles: {
+                    .init(
+                        auto: L("Automatic imports browser cookies or stored sessions."),
+                        manual: L("Paste a Cookie header from %@.", "a cursor.com request"),
+                        off: L("%@ cookies are disabled.", "Cursor"))
+                },
                 trailingText: {
-                    guard let entry = CookieHeaderCache.load(provider: .cursor) else { return nil }
-                    let when = entry.storedAt.relativeDescription()
-                    return "Cached: \(entry.sourceLabel) • \(when)"
+                    ProviderCookieSourceUI.cachedTrailingText(provider: .cursor)
                 }),
         ]
     }
 
     @MainActor
-    func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
-        _ = context
-        return []
-    }
-
-    @MainActor
     func runLoginFlow(context: ProviderLoginContext) async -> Bool {
         await context.controller.runCursorLoginFlow()
-        return true
     }
 
     @MainActor
     func appendUsageMenuEntries(context: ProviderMenuUsageContext, entries: inout [ProviderMenuEntry]) {
-        guard let cost = context.snapshot?.providerCost, cost.currencyCode != "Quota" else { return }
-        let used = UsageFormatter.currencyString(cost.used, currencyCode: cost.currencyCode)
+        guard context.settings.showOptionalCreditsAndExtraUsage,
+              let cost = context.snapshot?.providerCost,
+              cost.currencyCode != "Quota"
+        else { return }
+        let used = UsageFormatter.convertedCostString(
+            cost.used,
+            preferredCurrency: context.settings.preferredCurrencyCode,
+            providerCurrency: cost.currencyCode)
         if cost.limit > 0 {
-            let limitStr = UsageFormatter.currencyString(cost.limit, currencyCode: cost.currencyCode)
-            entries.append(.text("On-Demand: \(used) / \(limitStr)", .primary))
+            let limitStr = UsageFormatter.convertedCostString(
+                cost.limit,
+                preferredCurrency: context.settings.preferredCurrencyCode,
+                providerCurrency: cost.currencyCode)
+            entries.append(.text(String(format: L("cursor_on_demand_with_limit"), used, limitStr), .primary))
         } else {
-            entries.append(.text("On-Demand: \(used)", .primary))
+            entries.append(.text(String(format: L("cursor_on_demand"), used), .primary))
         }
     }
 }

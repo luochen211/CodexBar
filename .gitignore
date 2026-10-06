@@ -1,5 +1,9 @@
 # Xcode user/session
 xcuserdata/
+.swiftpm/xcode/xcshareddata/
+.codexbar/config.json
+*.env
+*.local
 
 # Build products
 .build/
@@ -14,6 +18,8 @@ Codexbar.app/
 # Release artifacts
 *.ipa
 *.dSYM*
+*.xcarchive/
+*.xcresult/
 *.zip
 *.delta
 *.dmg
@@ -27,9 +33,13 @@ debug_*.swift
 .DS_Store
 .vscode/
 .codex/environments/
+.swiftpm-cache/
+.tmp-clang/
+__pycache__/
 
 # Debug/analysis docs
 docs/*-analysis.md
+docs/.viewport-audit/
 docs/.astro/
 
 # Swift Package Manager metadata (leave sources tracked)

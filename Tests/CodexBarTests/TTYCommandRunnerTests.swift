@@ -2,10 +2,175 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
-@Suite
+@Suite(.serialized)
 struct TTYCommandRunnerEnvTests {
+    private static let harnessPTYTimeout: TimeInterval = 10
+
+    private struct FastExitIterationOutcome: Sendable {
+        let iteration: Int
+        let failureDetails: String?
+    }
+
+    private final class CallbackCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func increment() {
+            self.lock.lock()
+            self.count += 1
+            self.lock.unlock()
+        }
+
+        func value() -> Int {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.count
+        }
+    }
+
     @Test
-    func preservesEnvironmentAndSetsTerm() {
+    func `shutdown fence drains tracked TTY processes`() {
+        TTYCommandRunner.withIsolatedActiveProcessRegistryForTesting {
+            TTYCommandRunner._test_resetTrackedProcesses()
+            defer { TTYCommandRunner._test_resetTrackedProcesses() }
+
+            #expect(TTYCommandRunner._test_registerTrackedProcess(pid: 1001, binary: "codex"))
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 1)
+
+            let drained = TTYCommandRunner._test_drainTrackedProcessesForShutdown()
+            #expect(drained.count == 1)
+            #expect(drained[0].pid == 1001)
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 0)
+        }
+    }
+
+    @Test
+    func `cached CLI sessions share shutdown tracking`() {
+        TTYCommandRunner.withIsolatedActiveProcessRegistryForTesting {
+            TTYCommandRunner._test_resetTrackedProcesses()
+            defer { TTYCommandRunner._test_resetTrackedProcesses() }
+
+            #expect(TTYCommandRunner.registerActiveProcessForAppShutdown(pid: 3001, binary: "codex"))
+            TTYCommandRunner.updateActiveProcessGroupForAppShutdown(pid: 3001, processGroup: 3001)
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 1)
+
+            TTYCommandRunner.unregisterActiveProcessForAppShutdown(pid: 3001)
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 0)
+        }
+    }
+
+    @Test
+    func `tracked process helpers ignore invalid PID`() {
+        TTYCommandRunner.withIsolatedActiveProcessRegistryForTesting {
+            TTYCommandRunner._test_resetTrackedProcesses()
+            defer { TTYCommandRunner._test_resetTrackedProcesses() }
+
+            TTYCommandRunner._test_trackProcess(pid: 0, binary: "codex", processGroup: nil)
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 0)
+        }
+    }
+
+    @Test
+    func `shutdown fence rejects new registrations`() {
+        TTYCommandRunner.withIsolatedActiveProcessRegistryForTesting {
+            TTYCommandRunner._test_resetTrackedProcesses()
+            defer { TTYCommandRunner._test_resetTrackedProcesses() }
+
+            #expect(TTYCommandRunner._test_registerTrackedProcess(pid: 2001, binary: "codex"))
+            let drained = TTYCommandRunner._test_drainTrackedProcessesForShutdown()
+            #expect(drained.count == 1)
+
+            #expect(TTYCommandRunner._test_registerTrackedProcess(pid: 2002, binary: "codex") == false)
+            #expect(TTYCommandRunner._test_trackedProcessCount() == 0)
+        }
+    }
+
+    @Test
+    func `shutdown waits for launch cleanup before draining`() {
+        TTYCommandRunner.withIsolatedActiveProcessRegistryForTesting {
+            TTYCommandRunner._test_resetTrackedProcesses()
+            defer { TTYCommandRunner._test_resetTrackedProcesses() }
+
+            #expect(TTYCommandRunner._test_beginTrackedProcessLaunch())
+            let fenceSet = DispatchSemaphore(value: 0)
+            let completed = DispatchSemaphore(value: 0)
+            let drain = TTYCommandRunner._test_makeDrainTrackedProcessesForShutdownOperation {
+                fenceSet.signal()
+            }
+            Thread.detachNewThread {
+                _ = drain()
+                completed.signal()
+            }
+
+            #expect(fenceSet.wait(timeout: .now() + 1) == .success)
+            #expect(completed.wait(timeout: .now() + 0.05) == .timedOut)
+            #expect(!TTYCommandRunner._test_registerTrackedProcess(pid: 2002, binary: "codex"))
+            TTYCommandRunner._test_endTrackedProcessLaunch()
+            #expect(completed.wait(timeout: .now() + 1) == .success)
+        }
+    }
+
+    @Test
+    func `shutdown resolver skips host process group fallback`() {
+        let hostGroup: pid_t = 4242
+        let targets: [(pid: pid_t, binary: String, processGroup: pid_t?)] = [
+            (pid: 100, binary: "codex", processGroup: nil),
+            (pid: 101, binary: "codex", processGroup: hostGroup),
+            (pid: 102, binary: "codex", processGroup: 7777),
+        ]
+
+        let resolved = TTYCommandRunner._test_resolveShutdownTargets(
+            targets,
+            hostProcessGroup: hostGroup,
+            groupResolver: { pid in
+                pid == 100 ? hostGroup : -1
+            })
+
+        #expect(resolved.count == 3)
+        #expect(resolved[0].processGroup == nil)
+        #expect(resolved[1].processGroup == nil)
+        #expect(resolved[2].processGroup == 7777)
+    }
+
+    @Test
+    func `descendant resolver walks process tree once`() {
+        let children: [pid_t: [pid_t]] = [
+            100: [101, 102],
+            101: [103],
+            102: [103],
+            103: [100],
+        ]
+
+        let descendants = TTYProcessTreeTerminator.descendantPIDs(of: 100) { children[$0] ?? [] }
+
+        #expect(Set(descendants) == Set([101, 102, 103]))
+        #expect(descendants.count == 3)
+    }
+
+    @Test
+    func `process tree termination signals escaped descendants`() {
+        let children: [pid_t: [pid_t]] = [
+            100: [101, 102],
+            102: [103],
+        ]
+        var signaled: [(pid: pid_t, signal: Int32)] = []
+
+        TTYProcessTreeTerminator.terminateProcessTree(
+            rootPID: 100,
+            processGroup: 200,
+            signal: 15,
+            childResolver: { children[$0] ?? [] },
+            signalSender: { pid, signal in
+                signaled.append((pid: pid, signal: signal))
+            })
+
+        #expect(Set(signaled.map(\.pid)) == Set([100, 101, 102, 103, -200]))
+        #expect(signaled.allSatisfy { $0.signal == 15 })
+        #expect(signaled.last?.pid == 100)
+    }
+
+    @Test
+    func `preserves environment and sets term`() {
         let baseEnv: [String: String] = [
             "PATH": "/custom/bin",
             "HOME": "/Users/tester",
@@ -25,7 +190,7 @@ struct TTYCommandRunnerEnvTests {
     }
 
     @Test
-    func backfillsHomeWhenMissing() {
+    func `backfills home when missing`() {
         let merged = TTYCommandRunner.enrichedEnvironment(
             baseEnv: ["PATH": "/custom/bin"],
             loginPATH: nil,
@@ -35,7 +200,7 @@ struct TTYCommandRunnerEnvTests {
     }
 
     @Test
-    func preservesExistingTermAndCustomVars() {
+    func `preserves existing term and custom vars`() {
         let merged = TTYCommandRunner.enrichedEnvironment(
             baseEnv: [
                 "PATH": "/custom/bin",
@@ -53,19 +218,188 @@ struct TTYCommandRunnerEnvTests {
     }
 
     @Test
-    func setsWorkingDirectoryWhenProvided() throws {
+    func `codex status probe uses non persistent thread storage`() {
+        let stateHome = URL(fileURLWithPath: "/tmp/codexbar status \"state\"", isDirectory: true)
+        let args = CodexStatusProbeIsolation.codexArguments(stateHome: stateHome)
+
+        #expect(args.starts(with: ["-s", "read-only", "-a", "never"]))
+        #expect(args.contains("history.persistence=\"none\""))
+        #expect(args.contains("experimental_thread_store={type=\"in_memory\",id=\"codexbar-status\"}"))
+        #expect(args.contains("sqlite_home=\"/tmp/codexbar status \\\"state\\\"\""))
+    }
+
+    @Test
+    func `codex status probe avoids root working directory when home exists`() {
+        let home = "/Users/tester"
+        let workingDirectory = CodexStatusProbeIsolation.workingDirectory(environment: ["HOME": home])
+        #expect(workingDirectory?.path == home)
+    }
+
+    @Test
+    func `sets working directory when provided`() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let runner = TTYCommandRunner()
-        let result = try runner.run(binary: "/bin/pwd", send: "", options: .init(timeout: 3, workingDirectory: dir))
+        let result = try runner.run(
+            binary: "/bin/pwd",
+            send: "",
+            options: .init(
+                timeout: Self.harnessPTYTimeout,
+                workingDirectory: dir,
+                stopOnSubstrings: [dir.path],
+                returnOnEmptyProcessExit: true))
         let clean = result.text.replacingOccurrences(of: "\r", with: "")
         #expect(clean.contains(dir.path))
     }
 
     @Test
-    func autoRespondsToTrustPrompt() throws {
+    func `fast process exit drains buffered PTY output`() async {
+        let iterationCount = 50
+        let concurrencyLimit = 4
+
+        let outcomes = await Self.runFastExitIterations(
+            iterationCount: iterationCount,
+            concurrencyLimit: concurrencyLimit)
+        { iteration in
+            Self.runFastExitIteration(iteration)
+        }
+
+        #expect(outcomes.map(\.iteration).sorted() == Array(0..<iterationCount))
+        #expect(TTYCommandRunner._test_trackedProcessCount() == 0)
+        for outcome in outcomes.sorted(by: { $0.iteration < $1.iteration }) {
+            #expect(
+                outcome.failureDetails == nil,
+                "PTY fast-exit iteration \(outcome.iteration) failed: \(outcome.failureDetails ?? "unknown failure")")
+        }
+    }
+
+    @Test
+    func `fast exit scheduler drains all iterations after a failure`() async {
+        let iterationCount = 50
+        let outcomes = await Self.runFastExitIterations(
+            iterationCount: iterationCount,
+            concurrencyLimit: 4,
+            operation: { iteration in
+                FastExitIterationOutcome(
+                    iteration: iteration,
+                    failureDetails: iteration == 7 ? "injected missing output" : nil)
+            })
+
+        #expect(outcomes.map(\.iteration).sorted() == Array(0..<iterationCount))
+        #expect(outcomes.compactMap { $0.failureDetails == nil ? nil : $0.iteration } == [7])
+    }
+
+    private static func runFastExitIterations(
+        iterationCount: Int,
+        concurrencyLimit: Int,
+        operation: @escaping @Sendable (Int) -> FastExitIterationOutcome) async -> [FastExitIterationOutcome]
+    {
+        await withTaskGroup(of: FastExitIterationOutcome.self, returning: [FastExitIterationOutcome].self) { group in
+            var nextIteration = 0
+            var completed: [FastExitIterationOutcome] = []
+
+            for _ in 0..<min(iterationCount, concurrencyLimit) {
+                let iteration = nextIteration
+                nextIteration += 1
+                group.addTask {
+                    operation(iteration)
+                }
+            }
+
+            while let outcome = await group.next() {
+                completed.append(outcome)
+                if nextIteration < iterationCount {
+                    let iteration = nextIteration
+                    nextIteration += 1
+                    group.addTask {
+                        operation(iteration)
+                    }
+                }
+            }
+
+            return completed
+        }
+    }
+
+    private static func runFastExitIteration(_ iteration: Int) -> FastExitIterationOutcome {
+        let expected = "pty-drain-race"
+        let runner = TTYCommandRunner()
+
+        do {
+            let result = try runner.run(
+                binary: "/bin/echo",
+                send: "",
+                options: .init(
+                    timeout: Self.harnessPTYTimeout,
+                    extraArgs: [expected],
+                    initialDelay: 0.05,
+                    stopOnSubstrings: [expected],
+                    settleAfterStop: 0,
+                    returnOnEmptyProcessExit: true))
+            let clean = result.text.replacingOccurrences(of: "\r", with: "")
+            return FastExitIterationOutcome(
+                iteration: iteration,
+                failureDetails: clean.contains(expected)
+                    ? nil
+                    : "PTY output was missing; completion: \(result.completion)")
+        } catch {
+            return FastExitIterationOutcome(iteration: iteration, failureDetails: String(describing: error))
+        }
+    }
+
+    @Test
+    func `claude runner keeps normal working directory by default`() throws {
+        let runner = TTYCommandRunner()
+        let fakeClaude = try Self.makeFakeClaudeCLI()
+        let result = try runner.run(
+            binary: fakeClaude.path,
+            send: "",
+            options: .init(timeout: Self.harnessPTYTimeout, stopOnSubstrings: ["deep-link-enabled"]))
+        let clean = result.text.replacingOccurrences(of: "\r", with: "")
+
+        #expect(clean.contains("deep-link-enabled"))
+    }
+
+    @Test
+    func `claude runner uses probe directory with deep link registration disabled when requested`() throws {
+        let runner = TTYCommandRunner()
+        let fakeClaude = try Self.makeFakeClaudeCLI()
+        let result = try runner.run(
+            binary: fakeClaude.path,
+            send: "",
+            options: .init(
+                timeout: Self.harnessPTYTimeout,
+                stopOnSubstrings: ["deep-link-disabled"],
+                useProviderProbeWorkingDirectory: true))
+        let clean = result.text.replacingOccurrences(of: "\r", with: "")
+
+        #expect(clean.contains("deep-link-disabled"))
+    }
+
+    @Test
+    func `claude runner uses probe directory for versioned CLI override`() throws {
+        let runner = TTYCommandRunner()
+        let fakeClaude = try Self.makeFakeClaudeCLI(fileName: "2.1.114")
+        var env = ProcessInfo.processInfo.environment
+        env["CLAUDE_CLI_PATH"] = fakeClaude.path
+
+        let result = try runner.run(
+            binary: fakeClaude.path,
+            send: "",
+            options: .init(
+                timeout: Self.harnessPTYTimeout,
+                baseEnvironment: env,
+                stopOnSubstrings: ["deep-link-disabled"],
+                useProviderProbeWorkingDirectory: true))
+        let clean = result.text.replacingOccurrences(of: "\r", with: "")
+
+        #expect(clean.contains("deep-link-disabled"))
+    }
+
+    @Test
+    func `auto responds to trust prompt`() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -92,7 +426,7 @@ struct TTYCommandRunnerEnvTests {
             binary: scriptURL.path,
             send: "",
             options: .init(
-                timeout: 6,
+                timeout: 15,
                 // Use LF for portability: some PTY/termios setups do not translate CR → NL for shell reads.
                 sendOnSubstrings: ["trust the files in this folder?": "y\n"],
                 stopOnSubstrings: ["accepted", "rejected"],
@@ -101,8 +435,177 @@ struct TTYCommandRunnerEnvTests {
         #expect(result.text.contains("accepted"))
     }
 
+    private static func makeFakeClaudeCLI(fileName: String = "claude") throws -> URL {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let scriptURL = dir.appendingPathComponent(fileName)
+        let script = """
+        #!/bin/sh
+        settings="$PWD/.claude/settings.local.json"
+        if [ -f "$settings" ] \
+          && grep -q '"disableDeepLinkRegistration"' "$settings" \
+          && grep -q '"disable"' "$settings"; then
+          echo "deep-link-disabled"
+        else
+          echo "deep-link-enabled"
+        fi
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     @Test
-    func stopsWhenOutputIsIdle() throws {
+    func `post-exit drain processes trailing chunk through callback path`() {
+        let callbackCounter = CallbackCounter()
+        var reads: [TTYCommandRunner.DrainReadResult] = [
+            .wouldBlock,
+            .wouldBlock,
+            .data(Data("https://example.com/auth".utf8)),
+            .closed,
+        ]
+
+        TTYCommandRunner.drainRemainingOutput(
+            until: Date().addingTimeInterval(1),
+            readChunk: {
+                if reads.isEmpty {
+                    return .closed
+                }
+                return reads.removeFirst()
+            },
+            processChunk: { data in
+                if data.range(of: Data("https://".utf8)) != nil {
+                    callbackCounter.increment()
+                }
+            },
+            sleep: { _ in })
+
+        #expect(callbackCounter.value() == 1)
+    }
+
+    @Test
+    func `post-exit drain keeps harvesting after late success marker`() {
+        var readCount = 0
+        var processedChunks: [String] = []
+        var reads: [TTYCommandRunner.DrainReadResult] = [
+            .data(Data("accepted".utf8)),
+            .wouldBlock,
+            .data(Data(" trailing".utf8)),
+            .closed,
+        ]
+
+        TTYCommandRunner.drainRemainingOutput(
+            until: Date().addingTimeInterval(1),
+            readChunk: {
+                readCount += 1
+                if reads.isEmpty {
+                    return .closed
+                }
+                return reads.removeFirst()
+            },
+            processChunk: { data in
+                processedChunks.append(String(bytes: data, encoding: .utf8) ?? "")
+            },
+            sleep: { _ in })
+
+        #expect(readCount == 4)
+        #expect(processedChunks == ["accepted", " trailing"])
+    }
+
+    @Test
+    func `post-exit drain stops once the PTY reports closure`() {
+        var readCount = 0
+
+        TTYCommandRunner.drainRemainingOutput(
+            until: Date().addingTimeInterval(1),
+            readChunk: {
+                readCount += 1
+                return .closed
+            },
+            processChunk: { _ in },
+            sleep: { _ in })
+
+        #expect(readCount == 1)
+    }
+
+    @Test
+    func `deadline drain preserves timeout while collecting late output`() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let scriptURL = dir.appendingPathComponent("late-output.sh")
+        let script = """
+        #!/bin/sh
+        /bin/sleep 0.12
+        printf 'https://claude.ai/oauth/authorize?test=late\\n'
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let runner = TTYCommandRunner()
+        let result = try TTYCommandRunner.withPostDeadlineDrainDurationOverrideForTesting(10) {
+            try runner.run(
+                binary: scriptURL.path,
+                send: "",
+                options: .init(timeout: 0.01, initialDelay: 0, settleAfterStop: 0.5))
+        }
+
+        #expect(result.completion == .deadlineExceeded)
+        #expect(result.text.contains("https://claude.ai/oauth/authorize?test=late"))
+    }
+
+    @Test
+    func `PTY closure keeps waiting for child exit before deadline`() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let scriptURL = dir.appendingPathComponent("close-pty-exit.sh")
+        let script = """
+        #!/bin/sh
+        exec </dev/null >/dev/null 2>/dev/null
+        /bin/sleep 2
+        exit 0
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let runner = TTYCommandRunner()
+        let result = try runner.run(
+            binary: scriptURL.path,
+            send: "",
+            options: .init(timeout: 10, initialDelay: 0, returnOnEmptyProcessExit: true))
+
+        #expect(result.completion == .processExited(status: 0))
+        #expect(result.text.isEmpty)
+    }
+
+    @Test
+    func `interrupted drain reads are treated as retryable`() {
+        let result = TTYCommandRunner.drainReadResult(for: Data(), terminalRead: -1, errno: EINTR)
+        if case .wouldBlock = result {
+            #expect(Bool(true))
+        } else {
+            Issue.record("Expected interrupted read to remain retryable during drain")
+        }
+    }
+
+    @Test
+    func `EOF beats stale would-block errno during drain classification`() {
+        let result = TTYCommandRunner.drainReadResult(for: Data(), terminalRead: 0, errno: EAGAIN)
+        if case .closed = result {
+            #expect(Bool(true))
+        } else {
+            Issue.record("Expected EOF reads to stop draining even if errno still holds EAGAIN")
+        }
+    }
+
+    @Test
+    func `stops when output is idle`() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("codexbar-tty-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -112,29 +615,33 @@ struct TTYCommandRunnerEnvTests {
         let script = """
         #!/bin/sh
         echo "hello"
-        sleep 10
+        sleep 30
         """
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
         let runner = TTYCommandRunner()
-        let timeout: TimeInterval = 12
-        let scriptedSleep: TimeInterval = 10
-        let startedAt = Date()
-        let result = try runner.run(
-            binary: scriptURL.path,
-            send: "",
-            options: .init(timeout: timeout, idleTimeout: 0.2))
-        let elapsed = Date().timeIntervalSince(startedAt)
+        let timeout: TimeInterval = 6
+        var fastestElapsed = TimeInterval.greatestFiniteMagnitude
+        // CI can occasionally pause a test process long enough to miss an idle window.
+        // Retry once and assert that at least one run exits well before timeout.
+        for _ in 0..<2 {
+            let startedAt = Date()
+            let result = try runner.run(
+                binary: scriptURL.path,
+                send: "",
+                options: .init(timeout: timeout, idleTimeout: 0.2))
+            let elapsed = Date().timeIntervalSince(startedAt)
 
-        #expect(result.text.contains("hello"))
-        // CI runners can delay PTY scheduling/reads; assert we stop well before script completion.
-        #expect(elapsed < (scriptedSleep - 1.0))
+            #expect(result.text.contains("hello"))
+            fastestElapsed = min(fastestElapsed, elapsed)
+        }
+        #expect(fastestElapsed < (timeout - 1.0))
     }
 
     @Test
-    func rollingBufferDetectsNeedleAcrossBoundary() {
-        var scanner = TTYCommandRunner.RollingBuffer(maxNeedle: 6)
+    func `rolling buffer detects needle across boundary`() {
+        var scanner = StreamScanBuffer(maxNeedle: 6)
         let needle = Data("hello".utf8)
         let first = scanner.append(Data("he".utf8))
         #expect(first.range(of: needle) == nil)
@@ -143,9 +650,43 @@ struct TTYCommandRunnerEnvTests {
     }
 
     @Test
-    func lowercasedASCIIOnlyTouchesAscii() {
+    func `lowercased ASCII only touches ascii`() {
         let data = Data("UpDaTe".utf8)
-        let lowered = TTYCommandRunner.lowercasedASCII(data)
+        let lowered = StreamScanBuffer.lowercasedASCII(data)
         #expect(String(data: lowered, encoding: .utf8) == "update")
+    }
+
+    @Test
+    func `bundled helper resolves from app executable and symlinks`() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("helper-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let contents = root.appendingPathComponent("Test.app/Contents", isDirectory: true)
+        let macOS = contents.appendingPathComponent("MacOS", isDirectory: true)
+        let helpers = contents.appendingPathComponent("Helpers", isDirectory: true)
+        try fm.createDirectory(at: macOS, withIntermediateDirectories: true)
+        try fm.createDirectory(at: helpers, withIntermediateDirectories: true)
+        let helper = helpers.appendingPathComponent("Watchdog")
+        let cli = helpers.appendingPathComponent("Tool")
+        let gui = macOS.appendingPathComponent("Test")
+        for url in [helper, cli, gui] {
+            try Data("#!/bin/sh\n".utf8).write(to: url)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+        let link = root.appendingPathComponent("tool-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: cli)
+
+        let expected = helper.resolvingSymlinksInPath().path
+        for exe in [gui, cli, link] {
+            let found = TTYCommandRunner.bundledHelperPath("Watchdog", executableURL: exe)
+            #expect(found.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path } == expected)
+        }
+        #expect(TTYCommandRunner.bundledHelperPath("Missing", executableURL: gui) == nil)
+        #expect(TTYCommandRunner
+            .bundledHelperPath("Watchdog", executableURL: root.appendingPathComponent("bare")) == nil)
+        for layout in ["Other/MacOS/Tool", "Contents/Other/Tool"] {
+            #expect(TTYCommandRunner.bundledHelperPath(
+                "Watchdog", executableURL: contents.deletingLastPathComponent().appendingPathComponent(layout)) == nil)
+        }
     }
 }

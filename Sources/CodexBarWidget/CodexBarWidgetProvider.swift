@@ -7,59 +7,59 @@ enum ProviderChoice: String, AppEnum {
     case codex
     case claude
     case gemini
+    case alibaba
+    case alibabatokenplan
+    case qwencloud
     case antigravity
+    case cursor
     case zai
     case copilot
+    case devin
     case minimax
+    case kilo
     case opencode
+    case opencodego
+    case mistral
+    case kimi
+    case deepseek
+    case openrouter
+    case pi
 
     static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Provider")
 
+    /// AppIntents extracts this metadata statically; it must stay a literal, exhaustive
+    /// dictionary. WidgetProviderChoiceTests pins these titles to the descriptor registry.
+    /// Provider-specific by design: AppIntents requires a compile-time provider display inventory.
     static let caseDisplayRepresentations: [ProviderChoice: DisplayRepresentation] = [
         .codex: DisplayRepresentation(title: "Codex"),
         .claude: DisplayRepresentation(title: "Claude"),
         .gemini: DisplayRepresentation(title: "Gemini"),
+        .alibaba: DisplayRepresentation(title: "Alibaba"),
+        .alibabatokenplan: DisplayRepresentation(title: "Alibaba Token Plan"),
+        .qwencloud: DisplayRepresentation(title: "Qwen Cloud"),
         .antigravity: DisplayRepresentation(title: "Antigravity"),
-        .zai: DisplayRepresentation(title: "z.ai"),
+        .cursor: DisplayRepresentation(title: "Cursor"),
+        .zai: DisplayRepresentation(title: "z.ai / GLM"),
         .copilot: DisplayRepresentation(title: "Copilot"),
+        .devin: DisplayRepresentation(title: "Devin"),
         .minimax: DisplayRepresentation(title: "MiniMax"),
+        .kilo: DisplayRepresentation(title: "Kilo"),
         .opencode: DisplayRepresentation(title: "OpenCode"),
+        .opencodego: DisplayRepresentation(title: "OpenCode Go"),
+        .mistral: DisplayRepresentation(title: "Mistral"),
+        .kimi: DisplayRepresentation(title: "Kimi Code"),
+        .deepseek: DisplayRepresentation(title: "DeepSeek"),
+        .openrouter: DisplayRepresentation(title: "OpenRouter"),
+        .pi: DisplayRepresentation(title: "Pi"),
     ]
 
     var provider: UsageProvider {
-        switch self {
-        case .codex: .codex
-        case .claude: .claude
-        case .gemini: .gemini
-        case .antigravity: .antigravity
-        case .zai: .zai
-        case .copilot: .copilot
-        case .minimax: .minimax
-        case .opencode: .opencode
-        }
+        UsageProvider(rawValue: self.rawValue)!
     }
 
     init?(provider: UsageProvider) {
-        switch provider {
-        case .codex: self = .codex
-        case .claude: self = .claude
-        case .gemini: self = .gemini
-        case .antigravity: self = .antigravity
-        case .cursor: return nil // Cursor not yet supported in widgets
-        case .opencode: self = .opencode
-        case .zai: self = .zai
-        case .factory: return nil // Factory not yet supported in widgets
-        case .copilot: self = .copilot
-        case .minimax: self = .minimax
-        case .vertexai: return nil // Vertex AI not yet supported in widgets
-        case .kiro: return nil // Kiro not yet supported in widgets
-        case .augment: return nil // Augment not yet supported in widgets
-        case .jetbrains: return nil // JetBrains not yet supported in widgets
-        case .kimi: return nil // Kimi not yet supported in widgets
-        case .kimik2: return nil // Kimi K2 not yet supported in widgets
-        case .amp: return nil // Amp not yet supported in widgets
-        case .synthetic: return nil // Synthetic not yet supported in widgets
-        }
+        guard ProviderDescriptorRegistry.descriptor(for: provider).metadata.widgetSelectable else { return nil }
+        self.init(rawValue: provider.rawValue)
     }
 }
 
@@ -73,7 +73,7 @@ enum CompactMetric: String, AppEnum {
     static let caseDisplayRepresentations: [CompactMetric: DisplayRepresentation] = [
         .credits: DisplayRepresentation(title: "Credits left"),
         .todayCost: DisplayRepresentation(title: "Today cost"),
-        .last30DaysCost: DisplayRepresentation(title: "30d cost"),
+        .last30DaysCost: DisplayRepresentation(title: "Cost"),
     ]
 }
 
@@ -81,7 +81,7 @@ struct ProviderSelectionIntent: AppIntent, WidgetConfigurationIntent {
     static let title: LocalizedStringResource = "Provider"
     static let description = IntentDescription("Select the provider to display in the widget.")
 
-    @Parameter(title: "Provider")
+    @Parameter(title: "Provider", default: .codex)
     var provider: ProviderChoice
 
     init() {
@@ -113,10 +113,10 @@ struct CompactMetricSelectionIntent: AppIntent, WidgetConfigurationIntent {
     static let title: LocalizedStringResource = "Provider + Metric"
     static let description = IntentDescription("Select the provider and metric to display.")
 
-    @Parameter(title: "Provider")
+    @Parameter(title: "Provider", default: .codex)
     var provider: ProviderChoice
 
-    @Parameter(title: "Metric")
+    @Parameter(title: "Metric", default: .credits)
     var metric: CompactMetric
 
     init() {
@@ -166,9 +166,10 @@ struct CodexBarTimelineProvider: AppIntentTimelineProvider {
         in context: Context) async -> Timeline<CodexBarWidgetEntry>
     {
         let provider = configuration.provider.provider
-        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.snapshot()
-        let entry = CodexBarWidgetEntry(date: Date(), provider: provider, snapshot: snapshot)
-        let refresh = Date().addingTimeInterval(30 * 60)
+        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.emptySnapshot()
+        let now = Date()
+        let entry = CodexBarWidgetEntry(date: now, provider: provider, snapshot: snapshot)
+        let refresh = BurnDownRefreshSchedule.nextRefresh(snapshot: snapshot, provider: provider, now: now)
         return Timeline(entries: [entry], policy: .after(refresh))
     }
 }
@@ -176,7 +177,7 @@ struct CodexBarTimelineProvider: AppIntentTimelineProvider {
 struct CodexBarSwitcherTimelineProvider: TimelineProvider {
     func placeholder(in context: Context) -> CodexBarSwitcherEntry {
         let snapshot = WidgetPreviewData.snapshot()
-        let providers = self.availableProviders(from: snapshot)
+        let providers = Self.supportedProviders(from: snapshot)
         return CodexBarSwitcherEntry(
             date: Date(),
             provider: providers.first ?? .codex,
@@ -190,16 +191,19 @@ struct CodexBarSwitcherTimelineProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<CodexBarSwitcherEntry>) -> Void) {
         let entry = self.makeEntry()
-        let refresh = Date().addingTimeInterval(30 * 60)
+        let refresh = BurnDownRefreshSchedule.nextRefresh(
+            snapshot: entry.snapshot,
+            provider: entry.provider,
+            now: entry.date)
         completion(Timeline(entries: [entry], policy: .after(refresh)))
     }
 
     private func makeEntry() -> CodexBarSwitcherEntry {
-        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.snapshot()
-        let providers = self.availableProviders(from: snapshot)
+        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.emptySnapshot()
+        let providers = Self.supportedProviders(from: snapshot)
         let stored = WidgetSelectionStore.loadSelectedProvider()
-        let selected = providers.first { $0 == stored } ?? providers.first ?? .codex
-        if selected != stored {
+        let selected = providers.first { $0.instanceID == stored } ?? providers.first ?? .codex
+        if selected.instanceID != stored {
             WidgetSelectionStore.saveSelectedProvider(selected)
         }
         return CodexBarSwitcherEntry(
@@ -209,10 +213,16 @@ struct CodexBarSwitcherTimelineProvider: TimelineProvider {
             snapshot: snapshot)
     }
 
-    private func availableProviders(from snapshot: WidgetSnapshot) -> [UsageProvider] {
+    static func supportedProviders(from snapshot: WidgetSnapshot) -> [UsageProvider] {
         let enabled = snapshot.enabledProviders
-        let providers = enabled.isEmpty ? snapshot.entries.map(\.provider) : enabled
-        return providers.isEmpty ? [.codex] : providers
+        let instanceIDs = enabled.isEmpty ? snapshot.entries.map(\.provider) : enabled
+        let supported = instanceIDs.compactMap { instanceID -> UsageProvider? in
+            guard let provider = instanceID.firstPartyProvider, ProviderChoice(provider: provider) != nil else {
+                return nil
+            }
+            return provider
+        }
+        return supported.isEmpty ? [.codex] : supported
     }
 }
 
@@ -227,10 +237,11 @@ struct CodexBarCompactTimelineProvider: AppIntentTimelineProvider {
 
     func snapshot(for configuration: CompactMetricSelectionIntent, in context: Context) async -> CodexBarCompactEntry {
         let provider = configuration.provider.provider
+        let metric = configuration.metric
         return CodexBarCompactEntry(
             date: Date(),
             provider: provider,
-            metric: configuration.metric,
+            metric: metric,
             snapshot: WidgetSnapshotStore.load() ?? WidgetPreviewData.snapshot())
     }
 
@@ -239,11 +250,12 @@ struct CodexBarCompactTimelineProvider: AppIntentTimelineProvider {
         in context: Context) async -> Timeline<CodexBarCompactEntry>
     {
         let provider = configuration.provider.provider
-        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.snapshot()
+        let metric = configuration.metric
+        let snapshot = WidgetSnapshotStore.load() ?? WidgetPreviewData.emptySnapshot()
         let entry = CodexBarCompactEntry(
             date: Date(),
             provider: provider,
-            metric: configuration.metric,
+            metric: metric,
             snapshot: snapshot)
         let refresh = Date().addingTimeInterval(30 * 60)
         return Timeline(entries: [entry], policy: .after(refresh))
@@ -251,12 +263,25 @@ struct CodexBarCompactTimelineProvider: AppIntentTimelineProvider {
 }
 
 enum WidgetPreviewData {
+    static func emptySnapshot() -> WidgetSnapshot {
+        WidgetSnapshot(entries: [], enabledProviders: [], generatedAt: Date())
+    }
+
     static func snapshot() -> WidgetSnapshot {
-        let primary = RateWindow(usedPercent: 35, windowMinutes: nil, resetsAt: nil, resetDescription: "Resets in 4h")
-        let secondary = RateWindow(usedPercent: 60, windowMinutes: nil, resetsAt: nil, resetDescription: "Resets in 3d")
+        let now = Date()
+        let primary = RateWindow(
+            usedPercent: 35,
+            windowMinutes: 300,
+            resetsAt: now.addingTimeInterval(4 * 3600),
+            resetDescription: "Resets in 4h")
+        let secondary = RateWindow(
+            usedPercent: 60,
+            windowMinutes: 10080,
+            resetsAt: now.addingTimeInterval(3 * 86400),
+            resetDescription: "Resets in 3d")
         let entry = WidgetSnapshot.ProviderEntry(
             provider: .codex,
-            updatedAt: Date(),
+            updatedAt: now,
             primary: primary,
             secondary: secondary,
             tertiary: nil,
@@ -276,6 +301,6 @@ enum WidgetPreviewData {
                 WidgetSnapshot.DailyUsagePoint(dayKey: "2025-12-06", totalTokens: 70000, costUSD: 8.9),
                 WidgetSnapshot.DailyUsagePoint(dayKey: "2025-12-07", totalTokens: 110_000, costUSD: 13.7),
             ])
-        return WidgetSnapshot(entries: [entry], generatedAt: Date())
+        return WidgetSnapshot(entries: [entry], generatedAt: now)
     }
 }

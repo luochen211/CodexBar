@@ -1,23 +1,32 @@
 import CodexBarCore
 import Commander
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 #if canImport(Darwin)
 import Darwin
-#else
+#elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 import Foundation
+#if os(macOS)
+import CoreFoundation
+#endif
 
 extension CodexBarCLI {
     static func decodeProvider(from values: ParsedValues, config: CodexBarConfig) -> ProviderSelection {
         let rawOverride = values.options["provider"]?.last
-        return Self.providerSelection(rawOverride: rawOverride, enabled: config.enabledProviders())
+        return Self.providerSelection(
+            rawOverride: rawOverride,
+            enabled: config.enabledProviders().compactMap(\.firstPartyProvider))
     }
 
     static func providerSelection(rawOverride: String?, enabled: [UsageProvider]) -> ProviderSelection {
         if let rawOverride, let parsed = ProviderSelection(argument: rawOverride) {
             return parsed
         }
-        if enabled.count >= 3 { return .all }
         if enabled.count == 2 {
             let enabledSet = Set(enabled)
             let primary = Set(ProviderDescriptorRegistry.all.filter(\ .metadata.isPrimaryProvider).map(\ .id))
@@ -26,18 +35,17 @@ extension CodexBarCLI {
             }
             return .custom(enabled)
         }
-        if let first = enabled.first { return ProviderSelection(provider: first) }
-        return .single(.codex)
+        if enabled.count >= 3 {
+            return .custom(enabled)
+        }
+        if let first = enabled.first {
+            return ProviderSelection(provider: first)
+        }
+        return .custom([])
     }
 
     static func decodeFormat(from values: ParsedValues) -> OutputFormat {
-        if let raw = values.options["format"]?.last, let parsed = OutputFormat(argument: raw) {
-            return parsed
-        }
-        if values.flags.contains("jsonShortcut") || values.flags.contains("json") || values.flags.contains("jsonOnly") {
-            return .json
-        }
-        return .text
+        CLIOutputPreferences.resolveOutputFormat(from: values).format
     }
 
     static func decodeTokenAccountSelection(from values: ParsedValues) throws -> TokenAccountCLISelection {
@@ -56,9 +64,13 @@ extension CodexBarCLI {
 
     static func shouldUseColor(noColor: Bool, format: OutputFormat) -> Bool {
         guard format == .text else { return false }
-        if noColor { return false }
+        if noColor {
+            return false
+        }
         let env = ProcessInfo.processInfo.environment
-        if env["TERM"]?.lowercased() == "dumb" { return false }
+        if env["TERM"]?.lowercased() == "dumb" {
+            return false
+        }
         return isatty(STDOUT_FILENO) == 1
     }
 
@@ -86,7 +98,7 @@ extension CodexBarCLI {
         guard !attempts.isEmpty else { return }
         self.writeStderr("[\(provider.rawValue)] fetch strategies:\n")
         for attempt in attempts {
-            let kindLabel = Self.fetchKindLabel(attempt.kind)
+            let kindLabel = ProviderDiagnosticFetchAttempt.kindLabel(attempt.kind)
             var line = "  - \(attempt.strategyID) (\(kindLabel))"
             line += attempt.wasAvailable ? " available" : " unavailable"
             if let error = attempt.errorDescription, !error.isEmpty {
@@ -96,23 +108,93 @@ extension CodexBarCLI {
         }
     }
 
-    private static func fetchKindLabel(_ kind: ProviderFetchKind) -> String {
-        switch kind {
-        case .cli: "cli"
-        case .web: "web"
-        case .oauth: "oauth"
-        case .apiToken: "api"
-        case .localProbe: "local"
-        case .webDashboard: "web"
+    static func usageTextNotes(
+        provider: UsageProvider,
+        sourceMode: ProviderSourceMode,
+        resolvedSourceLabel: String,
+        dataConfidence: UsageDataConfidence = .unknown) -> [String]
+    {
+        // Provider-specific by design: OpenCode Go local quota windows need an explicit authority warning.
+        if provider == .opencodego, dataConfidence == .estimated {
+            return ["Quota estimated from local usage history"]
         }
+
+        // Provider-specific by design: Kilo automatic mode reports when its CLI fallback won strategy selection.
+        guard provider == .kilo,
+              sourceMode == .auto,
+              resolvedSourceLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "cli"
+        else {
+            return []
+        }
+        return ["Using CLI fallback"]
     }
 
-    static func fetchStatus(for provider: UsageProvider) async -> ProviderStatusPayload? {
+    static func kiloAutoFallbackSummary(
+        provider: UsageProvider,
+        sourceMode: ProviderSourceMode,
+        attempts: [ProviderFetchAttempt]) -> String?
+    {
+        // Provider-specific by design: Kilo exposes its ordered API-to-CLI fallback attempts in verbose output.
+        guard provider == .kilo, sourceMode == .auto, !attempts.isEmpty else { return nil }
+        let parts = attempts.map { attempt in
+            let label = ProviderDiagnosticFetchAttempt.kindLabel(attempt.kind)
+            let message = attempt.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !message.isEmpty {
+                return "\(label): \(message)"
+            }
+            return "\(label): \(attempt.wasAvailable ? "success" : "unavailable")"
+        }
+        return "Kilo auto fallback attempts: " + parts.joined(separator: " -> ")
+    }
+
+    /// Provider-specific by design: Antigravity's auto chain probes several
+    /// distinct local servers, so failures are attributed per source strategy
+    /// (app > cli > ide > oauth > offline) rather than by transport kind alone.
+    static func antigravityAutoFallbackSummary(
+        provider: UsageProvider,
+        sourceMode: ProviderSourceMode,
+        attempts: [ProviderFetchAttempt]) -> String?
+    {
+        guard provider == .antigravity, sourceMode == .auto, !attempts.isEmpty else { return nil }
+        let parts = attempts.map { attempt in
+            let source = Self.antigravitySourceShortLabel(attempt.strategyID)
+            switch attempt.outcome {
+            case .failed:
+                let message = attempt.errorDescription?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return "\(source): \(message.isEmpty ? "failed" : message)"
+            case .skipped:
+                return "\(source): skipped (unavailable)"
+            case .succeeded:
+                return "\(source): success"
+            }
+        }
+        return "Antigravity auto source outcomes: " + parts.joined(separator: " -> ")
+    }
+
+    /// Provider-specific by design: shortens Antigravity strategy IDs to their
+    /// source names (app/cli/ide/oauth/offline).
+    private static func antigravitySourceShortLabel(_ strategyID: String) -> String {
+        guard strategyID.hasPrefix("antigravity.") else { return strategyID }
+        let short = String(strategyID.dropFirst("antigravity.".count))
+        return short.replacingOccurrences(of: "-local", with: "")
+            .replacingOccurrences(of: "-https", with: "")
+    }
+
+    static func fetchStatus(
+        for provider: UsageProvider,
+        transport: any ProviderHTTPTransport = ProviderHTTPClient(session: .shared)) async -> ProviderStatusPayload?
+    {
         let urlString = ProviderDescriptorRegistry.descriptor(for: provider).metadata.statusPageURL
         guard let urlString,
               let baseURL = URL(string: urlString) else { return nil }
         do {
-            return try await StatusFetcher.fetch(from: baseURL)
+            let status = try await ProviderStatusFetcher.fetchStatus(from: baseURL, transport: transport)
+            return ProviderStatusPayload(
+                indicator: status.indicator,
+                description: status.description,
+                updatedAt: status.updatedAt,
+                url: urlString)
         } catch {
             return ProviderStatusPayload(
                 indicator: .unknown,
@@ -123,17 +205,78 @@ extension CodexBarCLI {
     }
 
     static func resetTimeDisplayStyleFromDefaults() -> ResetTimeDisplayStyle {
+        (self.boolFromAppDefaults("resetTimesShowAbsolute") ?? false) ? .absolute : .countdown
+    }
+
+    static func weeklyProgressWorkDaysFromDefaults() -> Int? {
         let domains = [
             "com.steipete.codexbar",
             "com.steipete.codexbar.debug",
         ]
         for domain in domains {
-            if let value = UserDefaults(suiteName: domain)?.object(forKey: "resetTimesShowAbsolute") as? Bool {
-                return value ? .absolute : .countdown
+            #if os(macOS)
+            let cfDomain = domain as CFString
+            CFPreferencesSynchronize(cfDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+            if let cfValue = CFPreferencesCopyValue(
+                "weeklyProgressWorkDays" as CFString,
+                cfDomain,
+                kCFPreferencesCurrentUser,
+                kCFPreferencesAnyHost) as? Int
+            {
+                return cfValue
+            }
+            #endif
+            if let value = UserDefaults(suiteName: domain)?.object(forKey: "weeklyProgressWorkDays") as? Int {
+                return value
             }
         }
-        let fallback = UserDefaults.standard.object(forKey: "resetTimesShowAbsolute") as? Bool ?? false
-        return fallback ? .absolute : .countdown
+        return UserDefaults.standard.object(forKey: "weeklyProgressWorkDays") as? Int
+    }
+
+    /// The app's "Hide personal information" privacy toggle. Read per request so the
+    /// serve dashboard follows the setting without a restart, the same way reset style
+    /// and weekly work days already do.
+    static func hidePersonalInfoFromDefaults() -> Bool {
+        self.boolFromAppDefaults("hidePersonalInfo") ?? false
+    }
+
+    /// The app's "Usage bars fill" preference (true = as used, false = as remaining). Read
+    /// per request so the serve dashboard follows the setting without a restart.
+    static func usageBarsShowUsedFromDefaults() -> Bool {
+        self.boolFromAppDefaults("usageBarsShowUsed") ?? false
+    }
+
+    static func boolFromAppDefaults(_ key: String) -> Bool? {
+        self.valueFromAppDefaults(key)
+    }
+
+    static func stringFromAppDefaults(_ key: String) -> String? {
+        let value: String? = self.valueFromAppDefaults(key)
+        return value?.isEmpty == false ? value : nil
+    }
+
+    static func valueFromAppDefaults<Value>(_ key: String) -> Value? {
+        for domain in ["com.steipete.codexbar", "com.steipete.codexbar.debug"] {
+            #if os(macOS)
+            let cfDomain = domain as CFString
+            CFPreferencesSynchronize(cfDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+            if let value = CFPreferencesCopyValue(
+                key as CFString, cfDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? Value,
+                (value as? String)?.isEmpty != true
+            {
+                return value
+            }
+            #endif
+            if let value = UserDefaults(suiteName: domain)?.object(forKey: key) as? Value,
+               (value as? String)?.isEmpty != true { return value }
+        }
+        return UserDefaults.standard.object(forKey: key) as? Value
+    }
+
+    static func costReportingPeriodFromDefaults() -> CostReportingPeriod {
+        .migrated(
+            rawValue: self.stringFromAppDefaults(CostReportingPeriod.defaultsKey),
+            legacyDays: self.valueFromAppDefaults(CostReportingPeriod.legacyDaysKey))
     }
 
     static func fetchProviderUsage(
@@ -163,33 +306,65 @@ extension CodexBarCLI {
 
     static func loadOpenAIDashboardIfAvailable(
         usage: UsageSnapshot,
-        fetcher: UsageFetcher) -> OpenAIDashboardSnapshot?
+        sourceLabel: String,
+        context: ProviderFetchContext) -> OpenAIDashboardSnapshot?
     {
         guard let cache = OpenAIDashboardCacheStore.load() else { return nil }
-        let codexEmail = (usage.accountEmail(for: .codex) ?? fetcher.loadAccountInfo().email)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let codexEmail, !codexEmail.isEmpty else { return nil }
-        if cache.accountEmail.lowercased() != codexEmail.lowercased() { return nil }
-        if cache.snapshot.dailyBreakdown.isEmpty, !cache.snapshot.creditEvents.isEmpty {
-            return OpenAIDashboardSnapshot(
+        let snapshot: OpenAIDashboardSnapshot = if cache.snapshot.dailyBreakdown.isEmpty,
+                                                   !cache.snapshot.creditEvents.isEmpty
+        {
+            OpenAIDashboardSnapshot(
                 signedInEmail: cache.snapshot.signedInEmail,
+                accountID: cache.snapshot.accountID,
                 codeReviewRemainingPercent: cache.snapshot.codeReviewRemainingPercent,
+                codeReviewLimit: cache.snapshot.codeReviewLimit,
                 creditEvents: cache.snapshot.creditEvents,
                 dailyBreakdown: OpenAIDashboardSnapshot.makeDailyBreakdown(
                     from: cache.snapshot.creditEvents,
                     maxDays: 30),
                 usageBreakdown: cache.snapshot.usageBreakdown,
                 creditsPurchaseURL: cache.snapshot.creditsPurchaseURL,
+                primaryLimit: cache.snapshot.primaryLimit,
+                secondaryLimit: cache.snapshot.secondaryLimit,
+                extraRateWindows: cache.snapshot.extraRateWindows,
+                creditsRemaining: cache.snapshot.creditsRemaining,
+                creditsAvailable: cache.snapshot.creditsAvailable,
+                balanceIsWorkspace: cache.snapshot.balanceIsWorkspace,
+                codexCreditLimit: cache.snapshot.codexCreditLimit,
+                accountPlan: cache.snapshot.accountPlan,
+                subscriptionExpiresAt: cache.snapshot.subscriptionExpiresAt,
+                subscriptionRenewsAt: cache.snapshot.subscriptionRenewsAt,
                 updatedAt: cache.snapshot.updatedAt)
+        } else {
+            cache.snapshot
         }
-        return cache.snapshot
-    }
 
-    static func decodeWebTimeout(from values: ParsedValues) -> TimeInterval? {
-        if let raw = values.options["webTimeout"]?.last, let seconds = Double(raw) {
-            return seconds
+        let input = CodexCLIDashboardAuthorityContext.makeCachedDashboardInput(
+            dashboard: snapshot,
+            cachedAccountEmail: cache.accountEmail,
+            usage: usage,
+            sourceLabel: sourceLabel,
+            context: context)
+        let decision = CodexDashboardAuthority.evaluate(input)
+        if decision.allowedEffects.contains(.cachedDashboardReuse) {
+            return snapshot
+        }
+        if decision.cleanup.contains(.dashboardCache) {
+            OpenAIDashboardCacheStore.clear()
         }
         return nil
+    }
+
+    static func decodeWebTimeout(from values: ParsedValues) throws -> TimeInterval? {
+        guard let raw = values.options["webTimeout"]?.last else { return nil }
+        guard let seconds = Double(raw),
+              seconds.isFinite,
+              seconds >= 0,
+              seconds <= TimeInterval(Int64.max)
+        else {
+            throw CLIArgumentError("--web-timeout must be a finite, nonnegative number within the supported range.")
+        }
+        return seconds
     }
 
     static func decodeSourceMode(from values: ParsedValues) -> ProviderSourceMode? {
@@ -207,7 +382,13 @@ extension CodexBarCLI {
         }
         if let remaining = dash.codeReviewRemainingPercent {
             let percent = Int(remaining.rounded())
-            lines.append("Code review: \(percent)% remaining")
+            if let limit = dash.codeReviewLimit,
+               let reset = UsageFormatter.resetLine(for: limit, style: .countdown)
+            {
+                lines.append("Code review: \(percent)% remaining (\(reset))")
+            } else {
+                lines.append("Code review: \(percent)% remaining")
+            }
         }
         if let first = dash.creditEvents.first {
             let day = first.date.formatted(date: .abbreviated, time: .omitted)
@@ -228,6 +409,7 @@ extension CodexBarCLI {
         case CodexStatusProbeError.timedOut,
              TTYCommandRunner.Error.timedOut,
              GeminiStatusProbeError.timedOut,
+             ClaudeWebFetchStrategyError.timedOut,
              CostUsageError.timedOut:
             ExitCode(4)
         case ClaudeUsageError.parseFailed,
@@ -235,7 +417,8 @@ extension CodexBarCLI {
              CostUsageError.unsupportedProvider,
              UsageError.decodeFailed,
              UsageError.noRateLimitsFound,
-             GeminiStatusProbeError.parseFailed:
+             GeminiStatusProbeError.parseFailed,
+             GeminiStatusProbeError.consumerTierDeprecated:
             ExitCode(3)
         default:
             .failure
@@ -277,7 +460,7 @@ extension CodexBarCLI {
                     antigravityPlanInfo: nil,
                     openaiDashboard: nil,
                     error: self.makeErrorPayload(code: .failure, message: error.localizedDescription, kind: .config))
-                self.printJSON([payload], pretty: output.pretty)
+                self.printProviderPayloads([payload], output: output)
             } else {
                 self.writeStderr("Error: \(error.localizedDescription)\n")
             }
@@ -301,19 +484,43 @@ struct CLIArgumentError: LocalizedError {
 #if DEBUG
 extension CodexBarCLI {
     static func _usageSignatureForTesting() -> CommandSignature {
-        CommandSignature.describe(UsageOptions())
+        CommandSignature.describe(UsageOptions()).flattened()
     }
 
     static func _costSignatureForTesting() -> CommandSignature {
-        CommandSignature.describe(CostOptions())
+        CommandSignature.describe(CostOptions()).flattened()
+    }
+
+    static func _cacheSignatureForTesting() -> CommandSignature {
+        CommandSignature.describe(CacheOptions()).flattened()
+    }
+
+    static func _diagnoseSignatureForTesting() -> CommandSignature {
+        CommandSignature.describe(DiagnoseOptions()).flattened()
+    }
+
+    static func _configSetAPIKeySignatureForTesting() -> CommandSignature {
+        CommandSignature.describe(ConfigSetAPIKeyOptions()).flattened()
+    }
+
+    static func _configDumpSignatureForTesting() -> CommandSignature {
+        CommandSignature.describe(ConfigDumpOptions()).flattened()
+    }
+
+    static func _configProviderToggleSignatureForTesting() -> CommandSignature {
+        CommandSignature.describe(ConfigProviderToggleOptions()).flattened()
     }
 
     static func _decodeFormatForTesting(from values: ParsedValues) -> OutputFormat {
         self.decodeFormat(from: values)
     }
 
-    static func _decodeWebTimeoutForTesting(from values: ParsedValues) -> TimeInterval? {
-        self.decodeWebTimeout(from: values)
+    static func _decodeCostGroupByForTesting(from values: ParsedValues) -> CostGroupBy {
+        self.decodeCostGroupBy(from: values)
+    }
+
+    static func _decodeWebTimeoutForTesting(from values: ParsedValues) throws -> TimeInterval? {
+        try self.decodeWebTimeout(from: values)
     }
 
     static func _decodeSourceModeForTesting(from values: ParsedValues) -> ProviderSourceMode? {

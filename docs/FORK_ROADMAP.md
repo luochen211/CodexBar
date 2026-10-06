@@ -1,11 +1,14 @@
 ---
-summary: "Fork roadmap: phases, milestones, and planned improvements."
+summary: "Historical January 2026 topoffunnel fork roadmap; not the current product plan."
 read_when:
-  - Planning fork work
-  - Reviewing fork milestones
+  - Reviewing historical topoffunnel fork milestones
 ---
 
 # CodexBar Fork Roadmap
+
+> Historical January 2026 fork plan. Its phases and completion claims are preserved as context, not current tasks.
+> Augment, token accounts, and upstream helper scripts already exist in the main repository. Consult
+> [Vision](../VISION.md), [Providers](providers.md), and [Configuration](configuration.md) for current scope and behavior.
 
 This document outlines the development roadmap for the CodexBar fork maintained by Brandon Charleson.
 
@@ -118,7 +121,7 @@ This document outlines the development roadmap for the CodexBar fork maintained 
 
 **Files to Create:**
 - `Scripts/sync_upstream.sh`
-- `docs/UPSTREAM_SYNC.md`
+- `docs/UPSTREAM_STRATEGY.md`
 - `.github/workflows/upstream-sync-check.yml`
 
 ---
@@ -228,5 +231,5 @@ This document outlines the development roadmap for the CodexBar fork maintained 
 - [Augment Provider](augment.md) - Augment-specific documentation
 - [Development Guide](DEVELOPMENT.md) - Build and test instructions
 - [Provider Authoring](provider.md) - How to create new providers
-- [Upstream Sync](UPSTREAM_SYNC.md) - Syncing with original repository (TBD)
+- [Upstream Strategy](UPSTREAM_STRATEGY.md) - Syncing with original repository
 - [Quotio Analysis](QUOTIO_ANALYSIS.md) - Feature comparison (TBD)

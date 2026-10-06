@@ -1,32 +1,26 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh -p
+# -p blocks inherited functions and startup hooks before validation; it does not elevate privileges.
+set -eu
 
 APP="/Applications/CodexBar.app"
 HELPER="$APP/Contents/Helpers/CodexBarCLI"
-TARGETS=("/usr/local/bin/codexbar" "/opt/homebrew/bin/codexbar")
 
-if [[ ! -x "$HELPER" ]]; then
-  echo "CodexBarCLI helper not found at $HELPER. Please reinstall CodexBar." >&2
+if [ ! -x "$HELPER" ]; then
+  /bin/echo "CodexBarCLI helper not found at $HELPER. Please reinstall CodexBar." >&2
   exit 1
 fi
 
-install_script=$(mktemp)
-cat > "$install_script" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-HELPER="__HELPER__"
-TARGETS=("/usr/local/bin/codexbar" "/opt/homebrew/bin/codexbar")
+# Clear startup hooks and exported functions before entering the administrator shell.
+/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/osascript - "$HELPER" <<'APPLESCRIPT'
+on run argv
+  set helperPath to item 1 of argv
+  set installCommand to "set -eu" & linefeed & ¬
+    "/bin/mkdir -p /usr/local/bin /opt/homebrew/bin" & linefeed & ¬
+    "/bin/ln -sf " & quoted form of helperPath & " /usr/local/bin/codexbar" & linefeed & ¬
+    "/bin/ln -sf " & quoted form of helperPath & " /opt/homebrew/bin/codexbar"
 
-for t in "${TARGETS[@]}"; do
-  mkdir -p "$(dirname "$t")"
-  ln -sf "$HELPER" "$t"
-  echo "Linked $t -> $HELPER"
-done
-EOF
+  do shell script installCommand with administrator privileges
+end run
+APPLESCRIPT
 
-perl -pi -e "s#__HELPER__#$HELPER#g" "$install_script"
-
-osascript -e "do shell script \"bash '$install_script'\" with administrator privileges"
-rm -f "$install_script"
-
-echo "CodexBar CLI installed. Try: codexbar usage"
+/bin/echo "CodexBar CLI installed. Try: codexbar usage"

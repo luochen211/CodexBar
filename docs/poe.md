@@ -1,0 +1,50 @@
+---
+summary: "Poe provider: API key setup, point balance, and recent usage history."
+read_when:
+  - Configuring Poe usage
+  - Debugging Poe balance or history requests
+---
+
+# Poe Provider
+
+CodexBar reads Poe's official usage API with a manually configured API key. It does not perform OAuth login or import browser cookies.
+
+## Authentication
+
+Create or copy an API key from [Poe API Keys](https://poe.com/api/keys), then add it in CodexBar Settings → Providers → Poe.
+
+You can also set the environment variable:
+
+```bash
+export POE_API_KEY="..."
+```
+
+Or configure it through the CLI:
+
+```bash
+printf '%s' "$POE_API_KEY" | codexbar config set-api-key --provider poe --stdin
+```
+
+## Data Source
+
+CodexBar requests:
+
+- `GET https://api.poe.com/usage/current_balance`
+- `GET https://api.poe.com/usage/points_history`
+
+The current balance request is required. Recent points history is best-effort, so a history error does not hide a valid balance.
+History rows with invalid timestamps are skipped, including numeric timestamps outside the supported date range.
+
+## Display
+
+The provider shows the current point balance in the menu and menu bar. When available, recent history is grouped by day and shown in the usage detail.
+
+The 30-day history cutoff and today's totals use the same refresh timestamp, so pagination and daily grouping stay consistent throughout a refresh.
+The last 7 and 30 days totals cover rolling time windows, including days without activity. Older activity remains in the
+30-day chart without contributing to the 7-day total.
+
+## CLI Usage
+
+```bash
+codexbar --provider poe
+```

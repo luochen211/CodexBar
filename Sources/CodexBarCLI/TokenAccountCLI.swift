@@ -2,7 +2,7 @@ import CodexBarCore
 import Commander
 import Foundation
 
-struct TokenAccountCLISelection: Sendable {
+struct TokenAccountCLISelection {
     let label: String?
     let index: Int?
     let allAccounts: Bool
@@ -10,12 +10,31 @@ struct TokenAccountCLISelection: Sendable {
     var usesOverride: Bool {
         self.label != nil || self.index != nil || self.allAccounts
     }
+
+    func providerSelectionError(_ providers: [UsageProvider]) -> String? {
+        guard self.usesOverride else { return nil }
+        guard providers.count == 1 else { return "account selection requires a single provider." }
+        let provider = providers[0]
+        // Provider-specific by design: Codex exposes reconciled live/managed accounts beyond token accounts.
+        let includesReconciledAccounts = provider == .codex && self.allAccounts && self.label == nil && self
+            .index == nil
+        guard includesReconciledAccounts || TokenAccountSupportCatalog.support(for: provider) != nil else {
+            return "\(provider.rawValue) does not support token accounts."
+        }
+        return nil
+    }
+}
+
+enum TokenAccountCLIResolutionScope {
+    case configuredAccounts
+    case ambientAccount
 }
 
 enum TokenAccountCLIError: LocalizedError {
     case noAccounts(UsageProvider)
     case accountNotFound(UsageProvider, String)
     case indexOutOfRange(UsageProvider, Int, Int)
+    case antigravityCLIAccountSelectionUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +44,9 @@ enum TokenAccountCLIError: LocalizedError {
             "No token account labeled '\(label)' for \(provider.rawValue)."
         case let .indexOutOfRange(provider, index, count):
             "Token account index \(index) out of range for \(provider.rawValue) (1-\(count))."
+        case .antigravityCLIAccountSelectionUnsupported:
+            "Antigravity CLI uses its local login and cannot select saved Google accounts. " +
+                "Use --source auto or --source oauth with account selection."
         }
     }
 }
@@ -33,18 +55,51 @@ struct TokenAccountCLIContext {
     let selection: TokenAccountCLISelection
     let config: CodexBarConfig
     let accountsByProvider: [UsageProvider: ProviderTokenAccountData]
+    @ProcessEnvironment private var baseEnvironment: [String: String]
+    private let managedCodexAccountStoreURL: URL?
+    private let configStore: CodexBarConfigStore
 
-    init(selection: TokenAccountCLISelection, config: CodexBarConfig, verbose _: Bool) throws {
+    init(
+        selection: TokenAccountCLISelection,
+        config: CodexBarConfig,
+        verbose _: Bool,
+        resolutionScope: TokenAccountCLIResolutionScope = .configuredAccounts,
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        managedCodexAccountStoreURL: URL? = nil,
+        configStore: CodexBarConfigStore = CodexBarConfigStore()) throws
+    {
         self.selection = selection
         self.config = config
-        self.accountsByProvider = Dictionary(uniqueKeysWithValues: config.providers.compactMap { provider in
-            guard let accounts = provider.tokenAccounts else { return nil }
-            return (provider.id, accounts)
-        })
+        self.baseEnvironment = baseEnvironment
+        self.managedCodexAccountStoreURL = managedCodexAccountStoreURL
+        self.configStore = configStore
+        self.accountsByProvider = switch resolutionScope {
+        case .configuredAccounts:
+            Dictionary(uniqueKeysWithValues: config.providers.compactMap { provider in
+                guard let firstPartyProvider = provider.id.firstPartyProvider,
+                      let accounts = provider.tokenAccounts
+                else { return nil }
+                return (firstPartyProvider, accounts)
+            })
+        case .ambientAccount:
+            [:]
+        }
     }
 
-    func resolvedAccounts(for provider: UsageProvider) throws -> [ProviderTokenAccount] {
-        guard TokenAccountSupportCatalog.support(for: provider) != nil else { return [] }
+    func resolvedAccounts(
+        for provider: UsageProvider, sourceMode: ProviderSourceMode? = nil) throws -> [ProviderTokenAccount]
+    {
+        guard let support = TokenAccountSupportCatalog.support(for: provider) else { return [] }
+        let effectiveSourceMode = sourceMode ?? self.preferredSourceMode(for: provider)
+        // Provider-specific by design: agy owns its login; saved Google accounts cannot select its local identity.
+        if provider == .antigravity, effectiveSourceMode == .cli, self.selection.usesOverride {
+            throw TokenAccountCLIError.antigravityCLIAccountSelectionUnsupported
+        }
+        if !self.selection.usesOverride,
+           support.passiveSourceModes.contains(effectiveSourceMode)
+        {
+            return []
+        }
         guard let data = self.accountsByProvider[provider], !data.accounts.isEmpty else {
             if self.selection.usesOverride {
                 throw TokenAccountCLIError.noAccounts(provider)
@@ -75,155 +130,150 @@ struct TokenAccountCLIContext {
         return [data.accounts[clamped]]
     }
 
-    func settingsSnapshot(for provider: UsageProvider, account: ProviderTokenAccount?) -> ProviderSettingsSnapshot? {
+    func settingsSnapshot(
+        for provider: UsageProvider,
+        account: ProviderTokenAccount?,
+        codexActiveSourceOverride: CodexActiveSource? = nil) -> ProviderSettingsSnapshot?
+    {
         let config = self.providerConfig(for: provider)
-        let cookieHeader = self.manualCookieHeader(provider: provider, account: account, config: config)
-        let cookieSource = self.cookieSource(provider: provider, account: account, config: config)
-
-        switch provider {
-        case .codex:
-            return self.makeSnapshot(
-                codex: ProviderSettingsSnapshot.CodexProviderSettings(
-                    usageDataSource: .auto,
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .claude:
-            let claudeSource: ClaudeUsageDataSource = if provider == .claude,
-                                                         let account,
-                                                         TokenAccountSupportCatalog.isClaudeOAuthToken(account.token)
-            {
-                .oauth
-            } else {
-                .auto
-            }
-            let effectiveSource = (claudeSource == .oauth) ? ProviderCookieSource.off : cookieSource
-            return self.makeSnapshot(
-                claude: ProviderSettingsSnapshot.ClaudeProviderSettings(
-                    usageDataSource: claudeSource,
-                    webExtrasEnabled: false,
-                    cookieSource: effectiveSource,
-                    manualCookieHeader: claudeSource == .oauth ? nil : cookieHeader))
-        case .cursor:
-            return self.makeSnapshot(
-                cursor: ProviderSettingsSnapshot.CursorProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .opencode:
-            return self.makeSnapshot(
-                opencode: ProviderSettingsSnapshot.OpenCodeProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader,
-                    workspaceID: config?.workspaceID))
-        case .factory:
-            return self.makeSnapshot(
-                factory: ProviderSettingsSnapshot.FactoryProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .minimax:
-            return self.makeSnapshot(
-                minimax: ProviderSettingsSnapshot.MiniMaxProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader,
-                    apiRegion: self.resolveMiniMaxRegion(config)))
-        case .augment:
-            return self.makeSnapshot(
-                augment: ProviderSettingsSnapshot.AugmentProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .amp:
-            return self.makeSnapshot(
-                amp: ProviderSettingsSnapshot.AmpProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .kimi:
-            return self.makeSnapshot(
-                kimi: ProviderSettingsSnapshot.KimiProviderSettings(
-                    cookieSource: cookieSource,
-                    manualCookieHeader: cookieHeader))
-        case .zai:
-            return self.makeSnapshot(
-                zai: ProviderSettingsSnapshot.ZaiProviderSettings(apiRegion: self.resolveZaiRegion(config)))
-        case .jetbrains:
-            return self.makeSnapshot(
-                jetbrains: ProviderSettingsSnapshot.JetBrainsProviderSettings(
-                    ideBasePath: nil))
-        case .gemini, .antigravity, .copilot, .kiro, .vertexai, .kimik2, .synthetic:
-            return nil
+        // Provider-specific by design: managed Codex profiles require live reconciliation state that is not config.
+        if provider == .codex {
+            return ProviderSettingsSnapshot.make(codex: self.makeCodexSettingsSnapshot(
+                account: account,
+                codexActiveSourceOverride: codexActiveSourceOverride))
         }
+        guard let contribution = ProviderDescriptorRegistry.descriptor(for: provider)
+            .settingsSection
+            .credentialContribution(context: ProviderCredentialSettingsContext(config: config, account: account))
+        else { return nil }
+        return ProviderSettingsSnapshot(contributions: [contribution])
     }
 
-    private func makeSnapshot(
-        codex: ProviderSettingsSnapshot.CodexProviderSettings? = nil,
-        claude: ProviderSettingsSnapshot.ClaudeProviderSettings? = nil,
-        cursor: ProviderSettingsSnapshot.CursorProviderSettings? = nil,
-        opencode: ProviderSettingsSnapshot.OpenCodeProviderSettings? = nil,
-        factory: ProviderSettingsSnapshot.FactoryProviderSettings? = nil,
-        minimax: ProviderSettingsSnapshot.MiniMaxProviderSettings? = nil,
-        zai: ProviderSettingsSnapshot.ZaiProviderSettings? = nil,
-        kimi: ProviderSettingsSnapshot.KimiProviderSettings? = nil,
-        augment: ProviderSettingsSnapshot.AugmentProviderSettings? = nil,
-        amp: ProviderSettingsSnapshot.AmpProviderSettings? = nil,
-        jetbrains: ProviderSettingsSnapshot.JetBrainsProviderSettings? = nil) -> ProviderSettingsSnapshot
+    private func makeCodexSettingsSnapshot(
+        account: ProviderTokenAccount?,
+        codexActiveSourceOverride: CodexActiveSource? = nil) ->
+        ProviderSettingsSnapshot.CodexProviderSettings
     {
-        ProviderSettingsSnapshot.make(
-            codex: codex,
-            claude: claude,
-            cursor: cursor,
-            opencode: opencode,
-            factory: factory,
-            minimax: minimax,
-            zai: zai,
-            kimi: kimi,
-            augment: augment,
-            amp: amp,
-            jetbrains: jetbrains)
+        // Provider-specific by design: Codex settings include reconciliation state and profile-home selection.
+        let config = self.providerConfig(for: .codex)
+        let reconciliationSnapshot = self.codexAccountReconciler(
+            activeSource: codexActiveSourceOverride).loadSnapshot()
+        let resolvedActiveSource = CodexActiveSourceResolver.resolve(from: reconciliationSnapshot)
+        let cookieSettings = ProviderCredentialSettingsContext(config: config, account: account)
+            .cookieSettings(for: .codex)
+        return CodexProviderSettingsBuilder.make(input: CodexProviderSettingsBuilderInput(
+            usageDataSource: .auto,
+            cookieSource: cookieSettings.cookieSource,
+            manualCookieHeader: cookieSettings.manualCookieHeader,
+            reconciliationSnapshot: reconciliationSnapshot,
+            resolvedActiveSource: resolvedActiveSource))
     }
 
     func environment(
         base: [String: String],
         provider: UsageProvider,
-        account: ProviderTokenAccount?) -> [String: String]
+        account: ProviderTokenAccount?,
+        codexActiveSourceOverride: CodexActiveSource? = nil) -> [String: String]
     {
         let providerConfig = self.providerConfig(for: provider)
-        var env = ProviderConfigEnvironment.applyAPIKeyOverride(
+        var env = ProviderEnvironmentResolver.resolve(
             base: base,
             provider: provider,
-            config: providerConfig)
-        // If token account is selected, use its token instead of config's apiKey
-        if let account,
-           let override = TokenAccountSupportCatalog.envOverride(for: provider, token: account.token)
+            config: providerConfig,
+            selectedAccount: account)
+        // Provider-specific by design: managed Codex accounts select a distinct filesystem home, not a credential.
+        if provider == .codex,
+           let codexHomePath = self.codexHomePath(for: codexActiveSourceOverride)
         {
-            for (key, value) in override {
-                env[key] = value
-            }
+            env = CodexHomeScope.scopedEnvironment(base: env, codexHome: codexHomePath)
         }
         return env
     }
 
-    func applyAccountLabel(
-        _ snapshot: UsageSnapshot,
+    func tokenUpdater(for account: ProviderTokenAccount?) -> ProviderFetchContext.TokenAccountTokenUpdater? {
+        guard let account else { return nil }
+        let writeback = TokenAccountCLIWriteback(account: account, store: self.configStore)
+        return { provider, accountID, token in
+            await writeback.update(provider: provider, accountID: accountID, token: token)
+        }
+    }
+
+    func manualTokenUpdater() -> ProviderFetchContext.ProviderManualTokenUpdater {
+        { provider, token in
+            try? ProviderDescriptorRegistry.descriptor(for: provider).credentials?.persistManualToken(token)
+        }
+    }
+
+    @discardableResult
+    static func updateStoredTokenAccount(
+        store: CodexBarConfigStore,
         provider: UsageProvider,
-        account: ProviderTokenAccount) -> UsageSnapshot
+        accountID: UUID,
+        expectedToken: String,
+        token: String) throws -> Bool
     {
-        let label = account.label.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !label.isEmpty else { return snapshot }
-        let existing = snapshot.identity(for: provider)
-        let email = existing?.accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedEmail = (email?.isEmpty ?? true) ? label : email
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        var didUpdate = false
+        try store.updateIfAvailable { config in
+            guard var providerConfig = config.providerConfig(for: provider.instanceID),
+                  let data = providerConfig.tokenAccounts,
+                  let index = data.accounts.firstIndex(where: { $0.id == accountID })
+            else {
+                return false
+            }
+
+            let existing = data.accounts[index]
+            guard existing.token == expectedToken else {
+                CodexBarLog.logger(LogCategories.tokenAccounts).warning(
+                    "Skipped token account writeback: the stored credential changed during the fetch",
+                    metadata: ["provider": provider.rawValue])
+                return false
+            }
+            var accounts = data.accounts
+            accounts[index] = ProviderTokenAccount(
+                id: existing.id,
+                label: existing.label,
+                token: trimmed,
+                addedAt: existing.addedAt,
+                lastUsed: existing.lastUsed,
+                externalIdentifier: existing.externalIdentifier,
+                usageScope: existing.usageScope,
+                organizationID: existing.organizationID,
+                workspaceID: existing.workspaceID,
+                seatCreditEntitlement: existing.seatCreditEntitlement)
+            providerConfig.tokenAccounts = ProviderTokenAccountData(
+                version: data.version,
+                accounts: accounts,
+                activeIndex: data.clampedActiveIndex())
+            config.setProviderConfig(providerConfig)
+            didUpdate = true
+            return true
+        }
+        return didUpdate
+    }
+
+    func fetcher(base: UsageFetcher, provider: UsageProvider, env: [String: String]) -> UsageFetcher {
+        // Provider-specific by design: UsageFetcher owns Codex filesystem scopes and must be rebuilt with CODEX_HOME.
+        guard provider == .codex else { return base }
+        return UsageFetcher(environment: env)
+    }
+
+    func visibleCodexAccounts() -> CodexVisibleAccountProjection {
+        // Provider-specific by design: only Codex exposes reconciled live, managed, and profile-home accounts.
+        self.codexAccountReconciler().loadVisibleAccounts()
+    }
+
+    func applyCodexVisibleAccountLabel(_ snapshot: UsageSnapshot, account: CodexVisibleAccount) -> UsageSnapshot {
+        // Provider-specific by design: reconciled Codex accounts carry workspace labels outside token-account config.
+        let existing = snapshot.identity(for: .codex)
         let identity = ProviderIdentitySnapshot(
-            providerID: provider,
-            accountEmail: resolvedEmail,
-            accountOrganization: existing?.accountOrganization,
+            providerID: .codex,
+            accountEmail: account.email,
+            accountOrganization: account.workspaceLabel ?? existing?.accountOrganization,
             loginMethod: existing?.loginMethod)
-        return UsageSnapshot(
-            primary: snapshot.primary,
-            secondary: snapshot.secondary,
-            tertiary: snapshot.tertiary,
-            providerCost: snapshot.providerCost,
-            zaiUsage: snapshot.zaiUsage,
-            cursorRequests: snapshot.cursorRequests,
-            updatedAt: snapshot.updatedAt,
-            identity: identity)
+        return snapshot.withIdentity(identity)
     }
 
     func effectiveSourceMode(
@@ -231,14 +281,9 @@ struct TokenAccountCLIContext {
         provider: UsageProvider,
         account: ProviderTokenAccount?) -> ProviderSourceMode
     {
-        guard base == .auto,
-              provider == .claude,
-              let account,
-              TokenAccountSupportCatalog.isClaudeOAuthToken(account.token)
-        else {
-            return base
-        }
-        return .oauth
+        let config = self.providerConfig(for: provider)
+        return ProviderDescriptorRegistry.descriptor(for: provider).credentials?
+            .selectedAccountSourceMode(base: base, account: account, config: config) ?? base
     }
 
     func preferredSourceMode(for provider: UsageProvider) -> ProviderSourceMode {
@@ -247,60 +292,81 @@ struct TokenAccountCLIContext {
     }
 
     private func providerConfig(for provider: UsageProvider) -> ProviderConfig? {
-        self.config.providerConfig(for: provider)
+        self.config.providerConfig(for: provider.instanceID)
     }
 
-    private func manualCookieHeader(
-        provider: UsageProvider,
-        account: ProviderTokenAccount?,
-        config: ProviderConfig?) -> String?
-    {
-        if let account,
-           let support = TokenAccountSupportCatalog.support(for: provider),
-           case .cookieHeader = support.injection
+    private func codexAccountReconciler(activeSource: CodexActiveSource? = nil) -> DefaultCodexAccountReconciler {
+        // Provider-specific by design: this reconciles Codex profile homes with its managed-account store.
+        let storeLoader: @Sendable () throws -> ManagedCodexAccountSet = if let managedCodexAccountStoreURL {
+            {
+                try FileManagedCodexAccountStore(fileURL: managedCodexAccountStoreURL).loadAccounts()
+            }
+        } else {
+            {
+                try FileManagedCodexAccountStore().loadAccounts()
+            }
+        }
+        return DefaultCodexAccountReconciler(
+            storeLoader: storeLoader,
+            activeSource: activeSource ?? self.providerConfig(for: .codex)?.codexActiveSource ?? .liveSystem,
+            baseEnvironment: self.baseEnvironment,
+            profileHomePaths: self.providerConfig(for: .codex)?.codexProfileHomePaths ?? [],
+            managedEnvironmentBuilder: { environment, account in
+                CodexHomeScope.scopedEnvironment(base: environment, codexHome: account.managedHomePath)
+            })
+    }
+
+    private func codexHomePath(for activeSourceOverride: CodexActiveSource?) -> String? {
+        // Provider-specific by design: Codex profile selection changes the local data root for the whole fetcher.
+        let activeSource: CodexActiveSource = if let activeSourceOverride {
+            activeSourceOverride
+        } else {
+            CodexActiveSourceResolver.resolve(from: self.codexAccountReconciler().loadSnapshot())
+                .resolvedSource
+        }
+
+        switch activeSource {
+        case .liveSystem:
+            return nil
+        case let .managedAccount(id):
+            let accounts: ManagedCodexAccountSet? = if let managedCodexAccountStoreURL {
+                try? FileManagedCodexAccountStore(fileURL: managedCodexAccountStoreURL).loadAccounts()
+            } else {
+                try? FileManagedCodexAccountStore().loadAccounts()
+            }
+            return accounts?.account(id: id)?.managedHomePath
+        case let .profileHome(path):
+            guard let normalizedPath = CodexHomeScope.normalizedHomePath(path) else { return nil }
+            let configuredPaths = self.providerConfig(for: .codex)?.codexProfileHomePaths ?? []
+            return configuredPaths.contains {
+                CodexHomeScope.normalizedHomePath($0) == normalizedPath
+            } ? normalizedPath : nil
+        }
+    }
+}
+
+/// A fetch may persist a refreshed token and then discovered account metadata.
+private actor TokenAccountCLIWriteback {
+    private let accountID: UUID
+    private let store: CodexBarConfigStore
+    private var expectedToken: String
+
+    init(account: ProviderTokenAccount, store: CodexBarConfigStore) {
+        self.accountID = account.id
+        self.store = store
+        self.expectedToken = account.token
+    }
+
+    func update(provider: UsageProvider, accountID: UUID, token: String) {
+        guard accountID == self.accountID else { return }
+        if (try? TokenAccountCLIContext.updateStoredTokenAccount(
+            store: self.store,
+            provider: provider,
+            accountID: accountID,
+            expectedToken: self.expectedToken,
+            token: token)) == true
         {
-            if provider == .claude, TokenAccountSupportCatalog.isClaudeOAuthToken(account.token) {
-                return nil
-            }
-            let header = TokenAccountSupportCatalog.normalizedCookieHeader(account.token, support: support)
-            return header.isEmpty ? nil : header
+            self.expectedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return config?.sanitizedCookieHeader
-    }
-
-    private func cookieSource(
-        provider: UsageProvider,
-        account: ProviderTokenAccount?,
-        config: ProviderConfig?) -> ProviderCookieSource
-    {
-        if let override = config?.cookieSource { return override }
-        if let account, TokenAccountSupportCatalog.support(for: provider)?.requiresManualCookieSource == true {
-            if provider == .claude, TokenAccountSupportCatalog.isClaudeOAuthToken(account.token) {
-                return .off
-            }
-            return .manual
-        }
-        if config?.sanitizedCookieHeader != nil {
-            return .manual
-        }
-        return .auto
-    }
-
-    private func resolveZaiRegion(_ config: ProviderConfig?) -> ZaiAPIRegion {
-        guard let raw = config?.region?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return .global
-        }
-        return ZaiAPIRegion(rawValue: raw) ?? .global
-    }
-
-    private func resolveMiniMaxRegion(_ config: ProviderConfig?) -> MiniMaxAPIRegion {
-        guard let raw = config?.region?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return .global
-        }
-        return MiniMaxAPIRegion(rawValue: raw) ?? .global
     }
 }

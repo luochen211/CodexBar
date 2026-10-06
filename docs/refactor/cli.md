@@ -67,13 +67,12 @@ read_when:
    - Move defaults-backed computed properties to `SettingsStore+Defaults.swift`.
    - Move provider detection to `SettingsStore+ProviderDetection.swift`.
 6. **Provider toggles cleanup**
-   - Remove unused `ProviderToggleStore` + tests; keep migrator path for legacy toggles.
+   - Completed: provider enablement uses config; the config migrator retains the read path for legacy toggles.
 7. **Tests**
    - CLI json-only error payloads (invalid source, invalid provider selection).
    - Config validation (bad region/source/apiKey field).
    - SettingsStore order/toggle invariants still pass.
 8. **Verification**
-   - `swift test`, `swiftformat Sources Tests`, `swiftlint --strict`, `pnpm check`.
+   - `make test`, `swiftformat Sources Tests`, `swiftlint --strict`, `make check`.
    - `./Scripts/compile_and_run.sh`.
    - CLI e2e: `codexbar --json-only ...`, `codexbar config validate`.
-

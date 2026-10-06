@@ -1,12 +1,15 @@
 ---
-summary: "Fork quick start: differences, commands, and planned features."
+summary: "Historical topoffunnel fork quick start; superseded by the main README and development guide."
 read_when:
-  - Onboarding to the fork workflow
-  - Reviewing fork-specific changes
-  - Running fork maintenance commands
+  - Reviewing the original topoffunnel fork workflow
 ---
 
 # CodexBar Fork - Quick Start Guide
+
+> Historical guide for `topoffunnel/CodexBar`, not the current `steipete/CodexBar` setup process. Use the
+> [README](../README.md), [Development guide](DEVELOPMENT.md), and [release checklist](RELEASING.md) instead.
+> Augment and multi-account support are now part of the main repository. The claim below that Keychain prompts
+> are eliminated is obsolete; current boundaries and troubleshooting are in [Keychain prompts](keychain-prompts.md).
 
 **Fork Maintainer:** Brandon Charleson ([topoffunnel.com](https://topoffunnel.com))  
 **Original Author:** Peter Steinberger ([steipete](https://twitter.com/steipete))  
@@ -41,7 +44,7 @@ read_when:
 swift build
 
 # Run tests
-swift test
+make test
 
 # Format code
 swiftformat Sources Tests
@@ -57,11 +60,9 @@ cd /Users/steipete/Projects/codexbar && open -n /Users/steipete/Projects/codexba
 
 ### Release
 ```bash
-# Sign and notarize (keep in foreground!)
-./Scripts/sign-and-notarize.sh
-
-# Create appcast
-./Scripts/make_appcast.sh <zip> <feed-url>
+# Edit .mac-release.env first: MAC_RELEASE_REPO, feed URL, download URL,
+# bundle id, and Sparkle public/signing key must point at your fork.
+./Scripts/release.sh
 
 # See full release process
 cat docs/RELEASING.md
@@ -130,13 +131,13 @@ git push origin feature/my-feature
 ### Testing Changes
 ```bash
 # Run all tests
-swift test
+make test
 
 # Run specific test
 swift test --filter AugmentTests
 
 # Build and test together
-./Scripts/compile_and_run.sh
+./Scripts/compile_and_run.sh --test
 ```
 
 ### Updating Documentation

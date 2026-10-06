@@ -1,0 +1,87 @@
+import CodexBarCore
+import Foundation
+
+struct AzureOpenAIProviderImplementation: ProviderImplementation {
+    let id: UsageProvider = .azureopenai
+
+    @MainActor
+    func presentation(context _: ProviderPresentationContext) -> ProviderPresentation {
+        ProviderPresentation { _ in "api" }
+    }
+
+    @MainActor
+    func observeSettings(_ settings: SettingsStore) {
+        _ = settings.azureOpenAIAPIKey
+        _ = settings.azureOpenAIEndpoint
+        _ = settings.azureOpenAIDeploymentName
+        _ = settings.azureOpenAIAPIVersion
+    }
+
+    @MainActor
+    func isAvailable(context: ProviderAvailabilityContext) -> Bool {
+        let environment = context.environment
+        let hasEnvironmentConfig = AzureOpenAISettingsReader.apiKey(environment: environment) != nil &&
+            AzureOpenAISettingsReader.rawEndpoint(environment: environment) != nil &&
+            AzureOpenAISettingsReader.deploymentName(environment: environment) != nil
+        if hasEnvironmentConfig { return true }
+
+        return !context.settings.azureOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !context.settings.azureOpenAIEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !context.settings.azureOpenAIDeploymentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    @MainActor
+    func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
+        var options = [
+            ProviderSettingsPickerOption(id: "", title: "Default"),
+            ProviderSettingsPickerOption(id: "v1", title: "OpenAI-compatible v1"),
+        ]
+        let configuredVersion = context.settings.azureOpenAIAPIVersion
+        if !options.contains(where: { $0.id == configuredVersion }) {
+            options.append(ProviderSettingsPickerOption(id: configuredVersion, title: configuredVersion))
+        }
+        return [
+            ProviderSettingsPickerDescriptor(
+                id: "azure-openai-api-version",
+                title: "API version",
+                subtitle: "Default uses AZURE_OPENAI_API_VERSION when set.",
+                binding: context.binding(\.azureOpenAIAPIVersion),
+                options: options,
+                isVisible: nil,
+                onChange: nil),
+        ]
+    }
+
+    @MainActor
+    func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
+        [
+            ProviderSettingsFieldDescriptor(
+                id: "azure-openai-api-key",
+                title: "API key",
+                subtitle: "Stored in ~/.codexbar/config.json. AZURE_OPENAI_API_KEY is also supported.",
+                kind: .secure,
+                placeholder: "Azure OpenAI key",
+                binding: context.binding(\.azureOpenAIAPIKey),
+                actions: [],
+                isVisible: nil),
+            ProviderSettingsFieldDescriptor(
+                id: "azure-openai-endpoint",
+                title: "Endpoint",
+                subtitle: "Azure OpenAI resource endpoint. AZURE_OPENAI_ENDPOINT is also supported.",
+                kind: .plain,
+                placeholder: "https://resource.openai.azure.com",
+                binding: context.binding(\.azureOpenAIEndpoint),
+                actions: [],
+                isVisible: nil),
+            ProviderSettingsFieldDescriptor(
+                id: "azure-openai-deployment-name",
+                title: "Deployment",
+                subtitle: "Azure OpenAI deployment name. AZURE_OPENAI_DEPLOYMENT_NAME is also supported.",
+                kind: .plain,
+                placeholder: "gpt-4o-mini",
+                binding: context.binding(\.azureOpenAIDeploymentName),
+                actions: [],
+                isVisible: nil),
+        ]
+    }
+}

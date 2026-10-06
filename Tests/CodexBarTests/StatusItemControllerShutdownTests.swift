@@ -1,0 +1,690 @@
+import AppKit
+import CodexBarCore
+import Testing
+@testable import CodexBar
+
+@MainActor
+@Suite(.serialized)
+struct StatusItemControllerShutdownTests {
+    @Test(arguments: [false, true])
+    func `explicit provider reorder reassigns existing slots under stable identities`(reorderWhileMerged: Bool) throws {
+        let statusBar = RecordingStatusBar()
+        let controller = self.makeController(
+            statusBar: statusBar, merged: false, enabledProviders: [.codex, .claude])
+        defer {
+            controller.releaseStatusItemsForTesting()
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let defaults = controller.settings.userDefaults
+        let codexKey = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: "codexbar-codex")
+        let claudeKey = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: "codexbar-claude")
+        let mergedKey = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: "codexbar-merged")
+        let original = try #require(controller.statusItems[.codex])
+        defaults.set(200, forKey: codexKey)
+        defaults.set(400, forKey: claudeKey)
+        defaults.set(600, forKey: mergedKey)
+        if reorderWhileMerged {
+            controller.settings.mergeIcons = true
+            controller.handleProviderConfigChange(reason: "merge icons")
+        }
+        controller.settings.setProviderOrder([.claude, .codex])
+        controller.handleProviderConfigChange(reason: "test reorder")
+        if reorderWhileMerged {
+            controller.settings.mergeIcons = false
+            controller.handleProviderConfigChange(reason: "separate icons")
+        }
+        #expect(defaults.double(forKey: claudeKey) == 200)
+        #expect(defaults.double(forKey: codexKey) == 400)
+        #expect(defaults.double(forKey: mergedKey) == 600)
+        #expect(controller.statusItems[.codex] !== original)
+        #expect(controller.statusItems[.codex]?.autosaveName == "codexbar-codex")
+        #expect(controller.statusItems[.claude]?.autosaveName == "codexbar-claude")
+        let identitiesStayedVisible = statusBar.createdItems.allSatisfy(\.unnamedVisibleEvents.isEmpty)
+        #expect(identitiesStayedVisible)
+        let reordered = controller.statusItems[.codex]
+        controller.handleProviderConfigChange(reason: "ordinary refresh")
+        #expect(controller.statusItems[.codex] === reordered)
+        controller.settings.setProviderOrder([.gemini, .claude, .codex])
+        controller.handleProviderConfigChange(reason: "disabled provider reorder")
+        #expect(controller.statusItems[.codex] === reordered)
+        #expect(defaults.double(forKey: claudeKey) == 200)
+    }
+
+    @Test
+    func `app shutdown closes tracked menus and removes status items`() {
+        StatusItemController.menuCardRenderingEnabled = false
+        StatusItemController.setMenuRefreshEnabledForTesting(true)
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+
+        let settings = self.makeSettings()
+        settings.statusChecksEnabled = false
+        settings.refreshFrequency = .manual
+        settings.mergeIcons = true
+        let registry = ProviderRegistry.shared
+        if let codexMetadata = registry.metadata[.codex] {
+            settings.setProviderEnabled(provider: .codex, metadata: codexMetadata, enabled: true)
+        }
+        if let claudeMetadata = registry.metadata[.claude] {
+            settings.setProviderEnabled(provider: .claude, metadata: claudeMetadata, enabled: true)
+        }
+
+        let environment = Self.isolatedEnvironment()
+        let fetcher = UsageFetcher(environment: environment)
+        let store = UsageStore(
+            fetcher: fetcher,
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings,
+            startupBehavior: .testing,
+            environmentBase: environment)
+        let controller = StatusItemController(
+            store: store,
+            settings: settings,
+            account: AccountInfo(email: nil, plan: nil),
+            updater: DisabledUpdaterController(),
+            preferencesSelection: PreferencesSelection(),
+            statusBar: .system)
+
+        let menu = controller.makeMenu()
+        controller.menuWillOpen(menu)
+        let key = ObjectIdentifier(menu)
+        controller.menuRefreshTasks[key] = Task { try? await Task.sleep(for: .seconds(30)) }
+        controller.menuReadinessSignatures[key] = "readiness"
+        controller.menuIdentitySignatures[key] = "identity"
+        controller.nativeHighlightDeferredMenuRebuilds[key] = .init(provider: .codex)
+        controller.pendingMenuBaselineResyncs.insert(key)
+
+        #expect(controller.openMenus[key] === menu)
+        #expect(controller.mergedMenu != nil)
+        #expect(controller.statusItem.menu === controller.mergedMenu)
+
+        controller.prepareForAppShutdown()
+        controller.prepareForAppShutdown()
+
+        #expect(controller.hasPreparedForAppShutdown)
+        #expect(controller.openMenus.isEmpty)
+        #expect(controller.menuRefreshTasks.isEmpty)
+        #expect(controller.menuReadinessSignatures.isEmpty)
+        #expect(controller.menuIdentitySignatures.isEmpty)
+        #expect(controller.nativeHighlightDeferredMenuRebuilds.isEmpty)
+        #expect(controller.pendingMenuBaselineResyncs.isEmpty)
+        #expect(controller.providerSwitcherShortcutEventMonitor == nil)
+        #expect(controller.statusItem.menu == nil)
+        #expect(controller.statusItems.isEmpty)
+        #expect(controller.providerMenus.isEmpty)
+        #expect(controller.mergedMenu == nil)
+        #expect(controller.menuAppearanceObserver == nil)
+    }
+
+    @Test
+    func `app shutdown keeps merged and provider autosave identities and saved positions`() {
+        let statusBar = RecordingStatusBar()
+        let controller = self.makeController(statusBar: statusBar)
+        defer {
+            statusBar.onRemove = nil
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let providerItem = controller.lazyStatusItem(for: .claude)
+        let items = [controller.statusItem] + Array(controller.statusItems.values)
+        let names = items.map { $0.autosaveName ?? "" }
+        let visibility = Dictionary(uniqueKeysWithValues: items.map { (ObjectIdentifier($0), $0.isVisible) })
+        let defaults = controller.settings.userDefaults
+        statusBar.onRemove = { item in
+            #expect(controller.hasPreparedForAppShutdown)
+            #expect(controller.openMenus.isEmpty)
+            #expect(item.menu == nil)
+            #expect(item.isVisible == visibility[ObjectIdentifier(item)])
+            #expect(names.contains(item.autosaveName ?? ""))
+            let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: item.autosaveName ?? "")
+            // Model AppKit clearing the position during synchronous removal.
+            defaults.removeObject(forKey: key)
+        }
+        let menu = controller.makeMenu()
+        controller.menuWillOpen(menu)
+        providerItem.menu = NSMenu()
+        for case let item as RecordingStatusItem in items {
+            item.events.removeAll()
+        }
+        for (index, name) in names.enumerated() {
+            #expect(!name.isEmpty)
+            let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: name)
+            defaults.set(400 + index * 100, forKey: key)
+        }
+
+        controller.prepareForAppShutdown()
+        controller.prepareForAppShutdown()
+
+        for (index, item) in items.enumerated() {
+            #expect(item.autosaveName == names[index])
+            let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: names[index])
+            #expect(defaults.integer(forKey: key) == 400 + index * 100)
+        }
+        #expect(controller.statusItems.isEmpty)
+        #expect(statusBar.removedItems.count == items.count)
+        #expect(Set(statusBar.removedItems.map(ObjectIdentifier.init)) == Set(items.map(ObjectIdentifier.init)))
+        for case let item as RecordingStatusItem in items {
+            #expect(item.events == ["menu:nil", "remove"])
+        }
+    }
+
+    @Test
+    func `startup recovery keeps identities until hidden removal and preserves placement`() {
+        for merged in [true, false] {
+            // A quiet relaunch is already hosted; an update handoff can miss its first sample.
+            for unavailableSamples in [0, 1] {
+                let statusBar = RecordingStatusBar()
+                let controller = self.makeController(
+                    statusBar: statusBar, merged: merged, enabledProviders: [.codex, .claude])
+                defer {
+                    statusBar.onRemove = nil
+                    controller.prepareForAppShutdown()
+                    StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+                    StatusItemController.resetMenuRefreshEnabledForTesting()
+                }
+                let defaults = controller.settings.userDefaults
+                let expectedNames = controller.expectedVisibleStatusItemAutosaveNames
+                #expect(expectedNames == (merged ? ["codexbar-merged"] : ["codexbar-codex", "codexbar-claude"]))
+                let originalItems = statusBar.createdItems
+                let names = originalItems.map { $0.autosaveName ?? "" }
+                for (index, name) in names.enumerated() {
+                    defaults.set(
+                        400 + index * 100,
+                        forKey:
+                        MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: name))
+                }
+                statusBar.onRemove = { item in
+                    #expect(names.contains(item.autosaveName ?? ""))
+                    let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(
+                        autosaveName: item.autosaveName ?? "")
+                    defaults.removeObject(forKey: key)
+                }
+
+                var probe = StartupHostingProbe(unavailableSamples: unavailableSamples)
+                let launchedAt = Date()
+                var recoveries = 0
+                for sample in 0..<3 {
+                    let items = [controller.statusItem] + Array(controller.statusItems.values)
+                    if MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+                        appLaunchedAt: launchedAt,
+                        now: launchedAt.addingTimeInterval(2 + Double(sample)),
+                        snapshots: probe.sample(items))
+                    {
+                        recoveries += 1
+                        controller.recreateStatusItemsForVisibilityRecovery()
+                    }
+                }
+
+                #expect(recoveries == unavailableSamples)
+                #expect(statusBar.removedItems.count == originalItems.count * unavailableSamples)
+                #expect(controller.expectedVisibleStatusItemAutosaveNames == expectedNames)
+                #expect(controller.statusItem.autosaveName == "codexbar-merged")
+                for item in statusBar.createdItems {
+                    #expect(item.unnamedVisibleEvents.isEmpty)
+                    #expect(names.contains(item.firstShownName ?? ""))
+                }
+                // Model delayed cleanup of retired items after their replacements have been created.
+                for item in statusBar.removedItems {
+                    if let name = item.autosaveName {
+                        defaults.removeObject(forKey:
+                            MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: name))
+                    }
+                }
+                for (index, name) in names.enumerated() {
+                    let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: name)
+                    #expect(defaults.integer(forKey: key) == 400 + index * 100)
+                }
+            }
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func `runtime removal hides and removes before retiring identity and restores saved placement`(
+        invalidRewrite: Bool)
+    {
+        let statusBar = RecordingStatusBar()
+        let controller = self.makeController(statusBar: statusBar)
+        defer {
+            controller.prepareForAppShutdown()
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let defaults = controller.settings.userDefaults
+        for name in ["codexbar-merged", "codexbar-claude"] {
+            let item = RecordingStatusItem()
+            item.autosaveName = name
+            let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: name)
+            defaults.set(845, forKey: key)
+            item.events.removeAll()
+            statusBar.onRemove = { removed in
+                #expect(removed === item)
+                #expect(removed.autosaveName == name)
+                #expect(!removed.isVisible)
+                if invalidRewrite {
+                    defaults.set(Double.infinity, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+
+            controller.removeStatusItemPreservingPlacement(item)
+
+            #expect(item.events == ["visible:false", "remove", "name:nil"])
+            #expect(defaults.integer(forKey: key) == 845)
+        }
+        statusBar.onRemove = nil
+    }
+
+    @Test(arguments: [false, true])
+    func `visibility changes retain identity and restore saved placement`(invalidRewrite: Bool) {
+        let controller = self.makeController(statusBar: RecordingStatusBar())
+        defer {
+            controller.prepareForAppShutdown()
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let item = RecordingStatusItem()
+        item.autosaveName = "codexbar-claude"
+        let defaults = controller.settings.userDefaults
+        let key = MenuBarStatusItemPlacementPreflight.preferredPositionKey(autosaveName: item.autosaveName)
+        item.onVisibilityChange = {
+            if invalidRewrite {
+                defaults.set(Double.infinity, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        for isVisible in [false, true] {
+            defaults.set(845, forKey: key)
+
+            controller.setStatusItemVisiblePreservingPlacement(item, isVisible)
+
+            #expect(item.isVisible == isVisible)
+            #expect(item.autosaveName == "codexbar-claude")
+            #expect(defaults.integer(forKey: key) == 845)
+        }
+    }
+
+    @Test
+    func `status menu quit defers termination and leaves cleanup to the termination callback`() {
+        let controller = self.makeController()
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let menu = controller.makeMenu()
+        controller.menuWillOpen(menu)
+        let key = ObjectIdentifier(menu)
+
+        var scheduledTermination: (@MainActor () -> Void)?
+        var didTerminate = false
+        controller.scheduleQuitTermination = { operation in
+            scheduledTermination = operation
+        }
+        controller.terminateApplicationForQuit = {
+            #expect(!controller.hasPreparedForAppShutdown)
+            didTerminate = true
+        }
+
+        controller.quit()
+
+        #expect(scheduledTermination != nil)
+        #expect(!controller.hasPreparedForAppShutdown)
+        #expect(!didTerminate)
+        #expect(controller.openMenus[key] === menu)
+
+        scheduledTermination?()
+
+        #expect(didTerminate)
+        #expect(!controller.hasPreparedForAppShutdown)
+
+        // AppDelegate invokes this from applicationWillTerminate, after AppKit begins termination.
+        controller.prepareForAppShutdown()
+
+        #expect(controller.hasPreparedForAppShutdown)
+        #expect(controller.openMenus.isEmpty)
+        #expect(controller.statusItem.menu == nil)
+    }
+
+    @Test
+    func `settings route closes tracked menus before requesting the window`() {
+        let controller = self.makeController()
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        let menu = controller.makeMenu()
+        controller.menuWillOpen(menu)
+
+        var didRequestSettings = false
+        var requestedPane: SettingsPane? = .about
+        var hadOpenMenuWhenRequested = true
+        controller.setSettingsOpenHandler { pane in
+            didRequestSettings = true
+            requestedPane = pane
+            hadOpenMenuWhenRequested = !controller.openMenus.isEmpty
+        }
+
+        controller.showSettingsGeneral()
+
+        #expect(didRequestSettings)
+        #expect(requestedPane == nil)
+        #expect(!hadOpenMenuWhenRequested)
+        #expect(controller.openMenus.isEmpty)
+    }
+
+    @Test
+    func `provider settings action opens the requested provider pane`() {
+        let controller = self.makeController()
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        var requestedPane: SettingsPane?
+        controller.setSettingsOpenHandler { requestedPane = $0 }
+
+        let (selector, representedObject) = controller.selector(for: .providerSettings(.claude))
+        #expect(selector == #selector(StatusItemController.showProviderSettings(_:)))
+        #expect(representedObject as? String == UsageProvider.claude.rawValue)
+
+        let item = NSMenuItem(title: "Open Claude Settings…", action: selector, keyEquivalent: "")
+        item.representedObject = representedObject
+        controller.showProviderSettings(item)
+
+        #expect(requestedPane == .provider(UsageProvider.claude.instanceID))
+    }
+
+    @Test
+    func `app shutdown cancels forced enrichment`() async {
+        let controller = self.makeController()
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        controller.settings.statusChecksEnabled = false
+        controller.settings.costUsageEnabled = true
+        controller.settings.openAIWebAccessEnabled = false
+        controller.settings.codexCookieSource = .off
+        let tokenTail = CancellationAwareTokenTail()
+
+        controller.store._test_providerRefreshOverride = { _ in }
+        controller.store._test_codexCreditsLoaderOverride = {
+            CreditsSnapshot(remaining: 25, events: [], updatedAt: Date())
+        }
+        controller.store._test_tokenUsageRefreshOverride = { _, _ in
+            await tokenTail.run()
+        }
+        defer {
+            controller.store._test_providerRefreshOverride = nil
+            controller.store._test_codexCreditsLoaderOverride = nil
+            controller.store._test_tokenUsageRefreshOverride = nil
+        }
+
+        controller.refreshNow()
+        let didStartTokenTail = await tokenTail.waitUntilStarted()
+        #expect(didStartTokenTail)
+        guard didStartTokenTail else {
+            controller.prepareForAppShutdown()
+            return
+        }
+        await controller.manualRefreshTasks[.global]?.value
+        let enrichmentTask = controller.store.forcedRefreshEnrichmentTask
+        let requiredRefresh = Task { @MainActor in
+            await controller.store.refreshForSettingsChange()
+        }
+        for _ in 0..<100 where controller.store.requiredRefreshTask == nil {
+            await Task.yield()
+        }
+
+        #expect(controller.store.hasForcedRefreshEnrichmentInFlight)
+        #expect(controller.store.requiredRefreshTask != nil)
+        controller.prepareForAppShutdown()
+        await enrichmentTask?.value
+        await requiredRefresh.value
+
+        #expect(await tokenTail.wasCancelled())
+        #expect(!controller.store.hasForcedRefreshEnrichmentInFlight)
+        #expect(controller.store.forcedRefreshEnrichmentTask == nil)
+        #expect(controller.store.pendingForcedRefreshEnrichmentTask == nil)
+        #expect(controller.store.requiredRefreshTask == nil)
+        #expect(controller.store.pendingRequiredRefreshRequest == nil)
+        #expect(controller.store.openAIDashboardRefreshTask == nil)
+        #expect(controller.store.tokenRefreshInFlight.isEmpty)
+    }
+
+    @Test
+    func `app shutdown cancels active and pending forced enrichment without promotion`() async {
+        let controller = self.makeController()
+        defer {
+            StatusItemController.menuCardRenderingEnabled = !SettingsStore.isRunningTests
+            StatusItemController.resetMenuRefreshEnabledForTesting()
+        }
+        controller.settings.statusChecksEnabled = false
+        controller.settings.costUsageEnabled = true
+        controller.settings.openAIWebAccessEnabled = false
+        controller.settings.codexCookieSource = .off
+        let tokenTail = CancellationAwareTokenTail()
+
+        controller.store._test_providerRefreshOverride = { _ in }
+        controller.store._test_codexCreditsLoaderOverride = {
+            CreditsSnapshot(remaining: 25, events: [], updatedAt: Date())
+        }
+        controller.store._test_tokenUsageRefreshOverride = { _, _ in
+            await tokenTail.run()
+        }
+        defer {
+            controller.store._test_providerRefreshOverride = nil
+            controller.store._test_codexCreditsLoaderOverride = nil
+            controller.store._test_tokenUsageRefreshOverride = nil
+        }
+
+        controller.refreshNow()
+        let didStartTokenTail = await tokenTail.waitUntilStarted(count: 1)
+        #expect(didStartTokenTail)
+        guard didStartTokenTail else {
+            controller.prepareForAppShutdown()
+            return
+        }
+        await controller.manualRefreshTasks[.global]?.value
+
+        await controller.store.refresh(enrichmentMode: .forcedBackground)
+        let activeTask = controller.store.forcedRefreshEnrichmentTask
+        let pendingTask = controller.store.pendingForcedRefreshEnrichmentTask
+        #expect(activeTask != nil)
+        #expect(pendingTask != nil)
+
+        controller.prepareForAppShutdown()
+        await activeTask?.value
+        await pendingTask?.value
+
+        #expect(await tokenTail.startedCount() == 1)
+        #expect(await tokenTail.cancelledCount() == 1)
+        #expect(pendingTask?.isCancelled == true)
+        #expect(!controller.store.hasForcedRefreshEnrichmentInFlight)
+        #expect(controller.store.forcedRefreshEnrichmentTask == nil)
+        #expect(controller.store.pendingForcedRefreshEnrichmentTask == nil)
+    }
+
+    private func makeController(
+        statusBar: NSStatusBar = .system,
+        merged: Bool = true,
+        enabledProviders: Set<UsageProvider> = [.codex]) -> StatusItemController
+    {
+        StatusItemController.menuCardRenderingEnabled = false
+        StatusItemController.setMenuRefreshEnabledForTesting(true)
+
+        let settings = self.makeSettings()
+        settings.statusChecksEnabled = false
+        settings.refreshFrequency = .manual
+        settings.mergeIcons = merged
+        enableTestProviders(enabledProviders, settings: settings)
+
+        let environment = Self.isolatedEnvironment()
+        let fetcher = UsageFetcher(environment: environment)
+        let store = UsageStore(
+            fetcher: fetcher,
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings,
+            startupBehavior: .testing,
+            environmentBase: environment)
+        return StatusItemController(
+            store: store,
+            settings: settings,
+            account: AccountInfo(email: nil, plan: nil),
+            updater: DisabledUpdaterController(),
+            preferencesSelection: PreferencesSelection(),
+            statusBar: statusBar)
+    }
+
+    private func makeSettings() -> SettingsStore {
+        testSettingsStore(suiteName: "StatusItemControllerShutdownTests", userDefaults: InMemoryUserDefaults())
+    }
+
+    private static func isolatedEnvironment() -> [String: String] {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-tests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return [
+            "HOME": root.path,
+            "CODEX_HOME": root.appendingPathComponent(".codex", isDirectory: true).path,
+            "XDG_CONFIG_HOME": root.appendingPathComponent(".config", isDirectory: true).path,
+        ]
+    }
+}
+
+private final class RecordingStatusBar: NSStatusBar {
+    var createdItems: [RecordingStatusItem] = []
+    var removedItems: [NSStatusItem] = []
+    var onRemove: ((NSStatusItem) -> Void)?
+
+    override func statusItem(withLength length: CGFloat) -> NSStatusItem {
+        let item = RecordingStatusItem()
+        item.length = length
+        self.createdItems.append(item)
+        return item
+    }
+
+    override func removeStatusItem(_ item: NSStatusItem) {
+        (item as? RecordingStatusItem)?.events.append("remove")
+        self.removedItems.append(item)
+        self.onRemove?(item)
+    }
+}
+
+private final class RecordingStatusItem: NSStatusItem {
+    var events: [String] = []
+    var unnamedVisibleEvents: [String] = []
+    var firstShownName: String?
+    var onVisibilityChange: (() -> Void)?
+    private var recordedName: String?
+    private var recordedMenu: NSMenu?
+    private var recordedVisibility = true
+    private var recordedLength: CGFloat = 0
+
+    override var autosaveName: String! {
+        get { self.recordedName }
+        set {
+            self.recordedName = newValue
+            self.events.append("name:\(newValue ?? "nil")")
+            self.recordVisibleIdentity("name")
+        }
+    }
+
+    override var menu: NSMenu? {
+        get { self.recordedMenu }
+        set {
+            self.recordedMenu = newValue
+            self.events.append(newValue == nil ? "menu:nil" : "menu:set")
+        }
+    }
+
+    override var isVisible: Bool {
+        get { self.recordedVisibility }
+        set {
+            self.recordedVisibility = newValue
+            self.events.append("visible:\(newValue)")
+            self.recordVisibleIdentity("visibility")
+            self.onVisibilityChange?()
+        }
+    }
+
+    override var length: CGFloat {
+        get { self.recordedLength }
+        set {
+            self.recordedLength = newValue
+            self.recordVisibleIdentity("length")
+        }
+    }
+
+    override var button: NSStatusBarButton? {
+        nil
+    }
+
+    private func recordVisibleIdentity(_ event: String) {
+        // AppKit starts visible at zero width; record exposure after the existing naming factory.
+        guard self.recordedVisibility, self.recordedLength != 0 else { return }
+        if self.recordedName?.isEmpty != false {
+            self.unnamedVisibleEvents.append(event)
+        } else if self.firstShownName == nil {
+            self.firstShownName = self.recordedName
+        }
+    }
+}
+
+@MainActor
+private struct StartupHostingProbe {
+    var unavailableSamples: Int
+
+    mutating func sample(_ items: [NSStatusItem]) -> [StatusItemVisibilitySnapshot] {
+        let hosted = self.unavailableSamples == 0
+        self.unavailableSamples = max(0, self.unavailableSamples - 1)
+        return items.map {
+            StatusItemVisibilitySnapshot(
+                isVisible: $0.isVisible,
+                hasButton: true,
+                hasWindow: hosted,
+                hasScreen: hosted,
+                buttonWidth: 24)
+        }
+    }
+}
+
+private actor CancellationAwareTokenTail {
+    private var started = 0
+    private var cancelled = 0
+
+    func run() async {
+        self.started += 1
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            self.cancelled += 1
+        } catch {}
+    }
+
+    func waitUntilStarted(count: Int = 1, timeout: Duration = .seconds(5)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while self.started < count {
+            if ContinuousClock.now >= deadline {
+                return false
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
+    }
+
+    func wasCancelled() -> Bool {
+        self.cancelled > 0
+    }
+
+    func startedCount() -> Int {
+        self.started
+    }
+
+    func cancelledCount() -> Int {
+        self.cancelled
+    }
+}

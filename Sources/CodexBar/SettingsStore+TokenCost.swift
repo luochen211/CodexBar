@@ -1,14 +1,35 @@
+import CodexBarCore
 import Foundation
 
 extension SettingsStore {
+    func costSummaryShowsInline(for provider: UsageProvider) -> Bool {
+        // Provider-specific by design: Codex's local ledger can enable its summary without the global scanner.
+        let isEnabled = self.costUsageEnabled ||
+            (provider == .codex && self.codexLocalSessionCostLedgerEnabled)
+        return isEnabled &&
+            self.costSummaryDisplayStyle.showsInlineSummary
+    }
+
+    func costSummaryShowsSubmenu(for provider: UsageProvider) -> Bool {
+        self.isCostUsageEffectivelyEnabled(for: provider) &&
+            self.costSummaryDisplayStyle.showsCostSubmenu
+    }
+
     func applyTokenCostDefaultIfNeeded() {
+        // Tests cover detection directly; skip filesystem-driven auto-enablement to keep startup deterministic.
+        guard !Self.isRunningTests else { return }
         // Settings are persisted in UserDefaults.standard.
         guard UserDefaults.standard.object(forKey: "tokenCostUsageEnabled") == nil else { return }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
+            let environment = ProcessInfo.processInfo.environment
             let hasSources = await Task.detached(priority: .utility) {
-                Self.hasAnyTokenCostUsageSources()
+                let processContexts = await LocalAgentSessionScanner().piSessionProcessContexts(
+                    environment: environment)
+                return Self.hasAnyTokenCostUsageSources(
+                    env: environment,
+                    processContexts: processContexts)
             }.value
             guard hasSources else { return }
             guard UserDefaults.standard.object(forKey: "tokenCostUsageEnabled") == nil else { return }
@@ -18,8 +39,14 @@ extension SettingsStore {
 
     nonisolated static func hasAnyTokenCostUsageSources(
         env: [String: String] = ProcessInfo.processInfo.environment,
-        fileManager: FileManager = .default) -> Bool
+        fileManager: FileManager = .default,
+        homeDirectory: URL? = nil,
+        workingDirectory: URL? = nil,
+        processContexts: [PiSessionProcessContext] = []) -> Bool
     {
+        // Provider-specific by design: Codex, Claude, and Pi-family stores can auto-enable token cost.
+        let home = homeDirectory ?? fileManager.homeDirectoryForCurrentUser
+
         func hasAnyJsonl(in root: URL) -> Bool {
             guard fileManager.fileExists(atPath: root.path) else { return false }
             guard let enumerator = fileManager.enumerator(
@@ -39,7 +66,7 @@ extension SettingsStore {
             if let raw, !raw.isEmpty {
                 return URL(fileURLWithPath: raw).appendingPathComponent("sessions", isDirectory: true)
             }
-            return fileManager.homeDirectoryForCurrentUser
+            return home
                 .appendingPathComponent(".codex", isDirectory: true)
                 .appendingPathComponent("sessions", isDirectory: true)
         }()
@@ -51,29 +78,33 @@ extension SettingsStore {
                 .appendingPathComponent("archived_sessions", isDirectory: true)
         }()
 
-        if hasAnyJsonl(in: codexRoot) { return true }
-        if let archivedCodexRoot, hasAnyJsonl(in: archivedCodexRoot) { return true }
+        if hasAnyJsonl(in: codexRoot) {
+            return true
+        }
+        if let archivedCodexRoot, hasAnyJsonl(in: archivedCodexRoot) {
+            return true
+        }
 
-        let claudeRoots: [URL] = {
-            if let env = env["CLAUDE_CONFIG_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !env.isEmpty
-            {
-                return env.split(separator: ",").map { part in
-                    let raw = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let url = URL(fileURLWithPath: raw)
-                    if url.lastPathComponent == "projects" {
-                        return url
-                    }
-                    return url.appendingPathComponent("projects", isDirectory: true)
-                }
-            }
+        var piEnvironment = env
+        if piEnvironment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            piEnvironment["HOME"] = home.path
+        }
+        let piBaseDirectory = workingDirectory ?? URL(
+            fileURLWithPath: fileManager.currentDirectoryPath,
+            isDirectory: true)
+        let piRoots = PiFamilySessionRootResolver.costSessionRootURLs(
+            environment: piEnvironment,
+            baseDirectory: piBaseDirectory,
+            processContexts: processContexts)
+        if piRoots.contains(where: hasAnyJsonl(in:)) {
+            return true
+        }
 
-            let home = fileManager.homeDirectoryForCurrentUser
-            return [
-                home.appendingPathComponent(".config/claude/projects", isDirectory: true),
-                home.appendingPathComponent(".claude/projects", isDirectory: true),
-            ]
-        }()
+        let claudeRoots = ClaudeConfigPaths.costProjectsRoots(
+            environment: env,
+            homeDirectory: home,
+            fileManager: fileManager,
+            workingDirectory: workingDirectory)
 
         return claudeRoots.contains(where: hasAnyJsonl(in:))
     }

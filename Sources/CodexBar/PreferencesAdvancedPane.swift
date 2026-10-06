@@ -1,111 +1,88 @@
-import KeyboardShortcuts
+import CodexBarCore
 import SwiftUI
 
 @MainActor
 struct AdvancedPane: View {
     @Bindable var settings: SettingsStore
+    @Bindable var store: UsageStore
     @State private var isInstallingCLI = false
     @State private var cliStatus: String?
 
     var body: some View {
-        ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 16) {
-                SettingsSection(contentSpacing: 8) {
-                    Text("Keyboard shortcut")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
-                    HStack(alignment: .center, spacing: 12) {
-                        Text("Open menu")
-                            .font(.body)
-                        Spacer()
-                        KeyboardShortcuts.Recorder(for: .openMenu)
-                    }
-                    Text("Trigger the menu bar menu from anywhere.")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
-                }
-
-                Divider()
-
-                SettingsSection(contentSpacing: 10) {
-                    HStack(spacing: 12) {
-                        Button {
-                            Task { await self.installCLI() }
-                        } label: {
-                            if self.isInstallingCLI {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Text("Install CLI")
-                            }
-                        }
-                        .disabled(self.isInstallingCLI)
-
-                        if let status = self.cliStatus {
-                            Text(status)
-                                .font(.footnote)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(2)
+        Form {
+            Section {
+                LabeledContent {
+                    Button {
+                        Task { await self.installCLI() }
+                    } label: {
+                        if self.isInstallingCLI {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(L("install_cli"))
                         }
                     }
-                    Text("Symlink CodexBarCLI to /usr/local/bin and /opt/homebrew/bin as codexbar.")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
+                    .disabled(self.isInstallingCLI)
+                } label: {
+                    SettingsRowLabel(L("install_cli"), subtitle: L("install_cli_subtitle"))
                 }
-
-                Divider()
-
-                SettingsSection(contentSpacing: 10) {
-                    PreferenceToggleRow(
-                        title: "Show Debug Settings",
-                        subtitle: "Expose troubleshooting tools in the Debug tab.",
-                        binding: self.$settings.debugMenuEnabled)
-                    PreferenceToggleRow(
-                        title: "Surprise me",
-                        subtitle: "Check if you like your agents having some fun up there.",
-                        binding: self.$settings.randomBlinkEnabled)
+            } header: {
+                Text(L("section_command_line"))
+            } footer: {
+                if let status = self.cliStatus {
+                    SettingsSectionFooter(status)
                 }
-
-                Divider()
-
-                SettingsSection(contentSpacing: 10) {
-                    PreferenceToggleRow(
-                        title: "Hide personal information",
-                        subtitle: "Obscure email addresses in the menu bar and menu UI.",
-                        binding: self.$settings.hidePersonalInfo)
-                }
-
-                Divider()
-
-                SettingsSection(
-                    title: "Keychain access",
-                    caption: """
-                    Disable all Keychain reads and writes. Browser cookie import is unavailable; paste Cookie \
-                    headers manually in Providers.
-                    """) {
-                        PreferenceToggleRow(
-                            title: "Disable Keychain access",
-                            subtitle: "Prevents any Keychain access while enabled.",
-                            binding: self.$settings.debugDisableKeychainAccess)
-                    }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+
+            Section {
+                Toggle(isOn: self.$settings.hidePersonalInfo) {
+                    SettingsRowLabel(
+                        L("hide_personal_info_title"),
+                        subtitle: L("hide_personal_info_subtitle") + " " + L("hide_cost_history_identity_subtitle"))
+                }
+
+                Toggle(isOn: self.$settings.debugDisableKeychainAccess) {
+                    SettingsRowLabel(
+                        L("disable_keychain_access_title"),
+                        subtitle: L("disable_keychain_access_subtitle"))
+                }
+            } header: {
+                Text(L("section_privacy"))
+            } footer: {
+                SettingsSectionFooter(L("keychain_access_caption"))
+            }
+
+            Section {
+                Toggle(isOn: self.$settings.providerStorageFootprintsEnabled) {
+                    SettingsRowLabel(
+                        L("show_provider_storage_usage_title"),
+                        subtitle: L("show_provider_storage_usage_subtitle"))
+                }
+
+                Toggle(isOn: self.$settings.debugMenuEnabled) {
+                    SettingsRowLabel(L("show_debug_settings_title"), subtitle: L("show_debug_settings_subtitle"))
+                }
+            } header: {
+                Text(L("section_diagnostics"))
+            }
         }
+        .formStyle(.grouped)
+        .toggleStyle(.switch)
+        .scrollContentBackground(.hidden)
     }
 }
 
 extension AdvancedPane {
     private func installCLI() async {
-        if self.isInstallingCLI { return }
+        if self.isInstallingCLI {
+            return
+        }
         self.isInstallingCLI = true
         defer { self.isInstallingCLI = false }
 
         let helperURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/CodexBarCLI")
         let fm = FileManager.default
         guard fm.fileExists(atPath: helperURL.path) else {
-            self.cliStatus = "CodexBarCLI not found in app bundle."
+            self.cliStatus = L("cli_not_found")
             return
         }
 
@@ -114,35 +91,39 @@ extension AdvancedPane {
             "/opt/homebrew/bin/codexbar",
         ]
 
-        var results: [String] = []
+        var installed: [String] = []
+        var conflicts: [String] = []
+        var failures: [String] = []
         for dest in destinations {
             let dir = (dest as NSString).deletingLastPathComponent
             guard fm.fileExists(atPath: dir) else { continue }
-            guard fm.isWritableFile(atPath: dir) else {
-                results.append("No write access: \(dir)")
-                continue
-            }
 
             if fm.fileExists(atPath: dest) {
                 if Self.isLink(atPath: dest, pointingTo: helperURL.path) {
-                    results.append("Installed: \(dir)")
+                    installed.append("Installed: \(dir)")
                 } else {
-                    results.append("Exists: \(dir)")
+                    conflicts.append("Exists: \(dir)")
                 }
+                continue
+            }
+
+            guard fm.isWritableFile(atPath: dir) else {
+                failures.append("No write access: \(dir)")
                 continue
             }
 
             do {
                 try fm.createSymbolicLink(atPath: dest, withDestinationPath: helperURL.path)
-                results.append("Installed: \(dir)")
+                installed.append("Installed: \(dir)")
             } catch {
-                results.append("Failed: \(dir)")
+                failures.append("Failed: \(dir)")
             }
         }
 
-        self.cliStatus = results.isEmpty
-            ? "No writable bin dirs found."
-            : results.joined(separator: " · ")
+        self.cliStatus = Self.cliInstallStatus(
+            installed: installed,
+            conflicts: conflicts,
+            failures: failures)
     }
 
     private static func isLink(atPath path: String, pointingTo destination: String) -> Bool {
@@ -152,5 +133,18 @@ extension AdvancedPane {
             .standardizedFileURL
             .path
         return resolved == destination
+    }
+
+    static func cliInstallStatus(installed: [String], conflicts: [String], failures: [String]) -> String {
+        if installed.isEmpty == false {
+            return (installed + conflicts).joined(separator: " · ")
+        }
+        if conflicts.isEmpty == false {
+            return (conflicts + failures).joined(separator: " · ")
+        }
+        if failures.isEmpty == false {
+            return failures.joined(separator: " · ")
+        }
+        return L("no_writable_bin_dirs")
     }
 }

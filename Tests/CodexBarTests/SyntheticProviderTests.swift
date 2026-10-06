@@ -2,26 +2,24 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
-@Suite
 struct SyntheticSettingsReaderTests {
     @Test
-    func apiKeyReadsFromEnvironment() {
+    func `api key reads from environment`() {
         let token = SyntheticSettingsReader.apiKey(environment: ["SYNTHETIC_API_KEY": "abc123"])
         #expect(token == "abc123")
     }
 
     @Test
-    func apiKeyStripsQuotes() {
+    func `api key strips quotes`() {
         let token = SyntheticSettingsReader.apiKey(environment: ["SYNTHETIC_API_KEY": "\"token-xyz\""])
         #expect(token == "token-xyz")
     }
 }
 
-@Suite
-struct SyntheticUsageSnapshotTests {
+struct SyntheticPluginGoldenTests {
     @Test
-    func mapsUsageSnapshotWindows() throws {
-        let json = """
+    func `generic quota fixture matches the production golden`() async throws {
+        let snapshot = try await Self.fetch("""
         {
           "plan": "Starter",
           "quotas": [
@@ -29,38 +27,53 @@ struct SyntheticUsageSnapshotTests {
             { "name": "Daily", "max": 200, "remaining": 50, "window_minutes": 1440 }
           ]
         }
-        """
-        let data = try #require(json.data(using: .utf8))
-        let snapshot = try SyntheticUsageParser.parse(data: data, now: Date(timeIntervalSince1970: 123))
-        let usage = snapshot.toUsageSnapshot()
+        """)
 
-        #expect(usage.primary?.usedPercent == 25)
-        #expect(usage.secondary?.usedPercent == 75)
-        #expect(usage.secondary?.windowMinutes == 1440)
-        #expect(usage.loginMethod(for: .synthetic) == "Starter")
+        #expect(snapshot.primary?.usedPercent == 25)
+        #expect(snapshot.primary?.resetsAt == Date(timeIntervalSince1970: 1_735_689_600))
+        #expect(snapshot.secondary?.usedPercent == 75)
+        #expect(snapshot.secondary?.windowMinutes == 1440)
+        #expect(snapshot.identity?.loginMethod == "Starter")
     }
 
     @Test
-    func parsesSubscriptionQuota() throws {
-        let json = """
+    func `missing rolling lane keeps weekly and search slots`() async throws {
+        let snapshot = try await Self.fetch("""
         {
-          "subscription": {
-            "limit": 1350,
-            "requests": 73.8,
-            "renewsAt": "2026-01-11T11:23:38.600Z"
+          "weeklyTokenLimit": {
+            "nextRegenAt": "2026-04-17T05:19:30.000Z",
+            "percentRemaining": 98.0,
+            "maxCredits": "$36.00",
+            "remainingCredits": "$35.30",
+            "nextRegenCredits": "$0.72"
+          },
+          "search": {
+            "hourly": {
+              "limit": 250,
+              "requests": 2,
+              "renewsAt": "2026-04-17T04:30:01.494Z"
+            }
           }
         }
-        """
-        let data = try #require(json.data(using: .utf8))
-        let snapshot = try SyntheticUsageParser.parse(data: data, now: Date(timeIntervalSince1970: 123))
-        let usage = snapshot.toUsageSnapshot()
-        let expected = (73.8 / 1350.0) * 100
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let expectedReset = try #require(formatter.date(from: "2026-01-11T11:23:38.600Z"))
+        """)
 
-        #expect(abs((usage.primary?.usedPercent ?? 0) - expected) < 0.01)
-        #expect(usage.primary?.resetsAt == expectedReset)
-        #expect(usage.loginMethod(for: .synthetic) == nil)
+        #expect(snapshot.primary == nil)
+        #expect(snapshot.secondary?.usedPercent == 2)
+        #expect(snapshot.tertiary?.usedPercent == 0.8)
+        #expect(snapshot.providerCost?.limit == 36)
+        #expect(snapshot.providerCost?.used == 0.7000000000000028)
+    }
+
+    private static func fetch(_ body: String) async throws -> UsageSnapshot {
+        let transport = ProviderHTTPTransportHandler { request in
+            let response = try #require(HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            return (Data(body.utf8), response)
+        }
+        return try await ProviderPluginRuntime(bundledPlugin: "synthetic", transport: transport)
+            .fetchUsage(secrets: ["SYNTHETIC_API_KEY": "fixture-key"])
     }
 }

@@ -1,0 +1,395 @@
+import Foundation
+import Testing
+@testable import CodexBarCore
+
+@Suite(.serialized)
+struct ProviderHTTPClientTests {
+    @Test(arguments: [nil, URLError.Code.notConnectedToInternet, .cancelled])
+    func `request sessions preserve delegates and finish once on every outcome`(code: URLError.Code?) async throws {
+        let delegate = ProviderHTTPRedirectGuardDelegate()
+        let finished = LockIsolated<[URLSession]>([])
+        StubURLProtocol.handler = { request in
+            if let code { throw URLError(code) }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (Data("fixture".utf8), response)
+        }
+        defer { StubURLProtocol.handler = nil }
+        let factory = ProviderHTTPSessionFactory(
+            makeSession: { receivedDelegate in
+                #expect(receivedDelegate === delegate)
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [StubURLProtocol.self]
+                return URLSession(configuration: configuration, delegate: receivedDelegate, delegateQueue: nil)
+            },
+            finishSession: { session in
+                finished.setValue(finished.value + [session])
+                session.finishTasksAndInvalidate()
+            })
+        let request = try URLRequest(url: #require(URL(string: "https://provider.invalid/usage")))
+        for _ in 0..<2 {
+            if let code {
+                let error = await #expect(throws: URLError.self) {
+                    try await factory.response(for: request, delegate: delegate)
+                }
+                #expect(error?.code == code)
+            } else {
+                let response = try await factory.response(for: request, delegate: delegate)
+                #expect(response.statusCode == 200)
+                #expect(response.data == Data("fixture".utf8))
+            }
+        }
+        #expect(finished.value.count == 2)
+        #expect(finished.value[0] !== finished.value[1])
+    }
+
+    @Test(arguments: [
+        ["/usr/local/bin/codexbar", "--account", "swift-testing"],
+        ["/usr/local/bin/codexbar", "--account", "Example.xctest"],
+        ["/tmp/swift-testing/Example.xctest/codexbar", "usage"],
+    ])
+    func `ordinary runner-like arguments keep the production redirect guard`(arguments: [String]) async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RedirectProofURLProtocol.self]
+        configuration.timeoutIntervalForRequest = 3
+        let session = ProviderHTTPClient.sharedSession(
+            isRunningTests: TestProcessSafety.isRunningUnderTests(
+                processName: "codexbar", environment: [:], arguments: arguments),
+            configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        #expect(session.delegate is ProviderHTTPRedirectGuardDelegate)
+        let client = ProviderHTTPClient(session: session)
+        let source = try #require(URL(string: "https://provider.invalid/start"))
+        let allowed = try #require(URL(string: "https://provider.invalid/usage"))
+        let forbidden = try #require(URL(string: "https://other.invalid/capture"))
+        for destination in [allowed, forbidden] {
+            RedirectProofURLProtocol.destination.setValue(destination)
+            RedirectProofURLProtocol.requests.setValue([])
+            var request = URLRequest(url: source)
+            request.setValue("synthetic-test-key", forHTTPHeaderField: "x-api-key")
+
+            if destination == allowed {
+                let (data, response) = try await client.data(for: request)
+                #expect((response as? HTTPURLResponse)?.statusCode == 200)
+                #expect(String(data: data, encoding: .utf8) == "ok")
+                #expect(RedirectProofURLProtocol.requests.value.map(\.url) == [source, allowed])
+                #expect(RedirectProofURLProtocol.requests.value.last?
+                    .value(forHTTPHeaderField: "x-api-key") == "synthetic-test-key")
+            } else {
+                // URLProtocol does not complete a declined redirect; bound the fixture and verify no destination I/O.
+                let error = await #expect(throws: URLError.self) {
+                    _ = try await client.data(for: request)
+                }
+                #expect(error?.code == .timedOut)
+                #expect(RedirectProofURLProtocol.requests.value.map(\.url) == [source])
+            }
+        }
+    }
+
+    @Test
+    func `default client configuration fails blocked connections promptly`() {
+        let configuration = ProviderHTTPClient.defaultConfiguration()
+
+        #expect(configuration.timeoutIntervalForRequest == 30)
+        #expect(configuration.timeoutIntervalForResource == 90)
+        #if !os(Linux)
+        #expect(configuration.waitsForConnectivity == false)
+        #endif
+    }
+
+    @Test
+    func `client loads requests through an injected session`() async throws {
+        StubURLProtocol.requests = []
+        StubURLProtocol.handler = { request in
+            StubURLProtocol.requests.append(request)
+            let response = try HTTPURLResponse(
+                url: #require(request.url),
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"])!
+            return (Data(#"{"ok":true}"#.utf8), response)
+        }
+        defer {
+            StubURLProtocol.handler = nil
+            StubURLProtocol.requests = []
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = ProviderHTTPClient(session: URLSession(configuration: configuration))
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/status")))
+
+        let (data, response) = try await client.data(for: request)
+
+        let body = try #require(String(data: data, encoding: .utf8))
+        #expect(body == #"{"ok":true}"#)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        #expect(StubURLProtocol.requests.count == 1)
+        #expect(StubURLProtocol.requests.first?.url?.host == "example.com")
+    }
+
+    @Test
+    func `response helper unwraps HTTP responses`() async throws {
+        let transport = ProviderHTTPTransportHandler { request in
+            let response = try HTTPURLResponse(
+                url: #require(request.url),
+                statusCode: 204,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["X-Test": "ok"])!
+            return (Data("done".utf8), response)
+        }
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/ok")))
+
+        let response = try await transport.response(for: request)
+
+        #expect(response.statusCode == 204)
+        #expect(response.response.value(forHTTPHeaderField: "X-Test") == "ok")
+        #expect(String(data: response.data, encoding: .utf8) == "done")
+    }
+
+    @Test
+    func `response helper rejects non HTTP responses`() async throws {
+        let transport = ProviderHTTPTransportHandler { request in
+            let response = URLResponse(
+                url: request.url ?? URL(string: "https://example.com/not-http")!,
+                mimeType: nil,
+                expectedContentLength: 0,
+                textEncodingName: nil)
+            return (Data(), response)
+        }
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/not-http")))
+
+        await #expect(throws: URLError.self) {
+            _ = try await transport.response(for: request)
+        }
+    }
+
+    @Test
+    func `response helper retries transient HTTP status once`() async throws {
+        let script = ScriptedHTTPTransport(statusCodes: [503, 200])
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/retry")))
+
+        let response = try await script.response(for: request, retryPolicy: .testOneRetry)
+
+        #expect(response.statusCode == 200)
+        #expect(await script.requestCount() == 2)
+    }
+
+    @Test
+    func `response helper retries transient URL error once`() async throws {
+        let script = ScriptedHTTPTransport(results: [
+            .failure(URLError(.timedOut)),
+            .success(200),
+        ])
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/retry-error")))
+
+        let response = try await script.response(for: request, retryPolicy: .testOneRetry)
+
+        #expect(response.statusCode == 200)
+        #expect(await script.requestCount() == 2)
+    }
+
+    @Test
+    func `response helper does not retry non idempotent methods`() async throws {
+        let script = ScriptedHTTPTransport(statusCodes: [503, 200])
+        var request = try URLRequest(url: #require(URL(string: "https://example.com/post")))
+        request.httpMethod = "POST"
+
+        let response = try await script.response(for: request, retryPolicy: .testOneRetry)
+
+        #expect(response.statusCode == 503)
+        #expect(await script.requestCount() == 1)
+    }
+
+    @Test
+    func `response helper does not retry auth failures`() async throws {
+        let script = ScriptedHTTPTransport(statusCodes: [403, 200])
+        let request = try URLRequest(url: #require(URL(string: "https://example.com/forbidden")))
+
+        let response = try await script.response(for: request, retryPolicy: .testOneRetry)
+
+        #expect(response.statusCode == 403)
+        #expect(await script.requestCount() == 1)
+    }
+
+    @Test
+    func `redirect guard blocks cross origin redirects`() throws {
+        var redirectRequest = try URLRequest(url: #require(URL(string: "https://attacker.example/capture")))
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "Cookie")
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "x-api-key")
+
+        let guarded = ProviderHTTPRedirectGuardDelegate.guardedRedirectRequest(
+            originalURL: URL(string: "https://provider.example/usage"),
+            redirectRequest: redirectRequest)
+
+        #expect(guarded == nil)
+    }
+
+    @Test
+    func `redirect guard blocks non HTTPS redirects`() throws {
+        var redirectRequest = try URLRequest(url: #require(URL(string: "http://provider.example/capture")))
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "Cookie")
+
+        let guarded = ProviderHTTPRedirectGuardDelegate.guardedRedirectRequest(
+            originalURL: URL(string: "https://provider.example/usage"),
+            redirectRequest: redirectRequest)
+
+        #expect(guarded == nil)
+    }
+
+    @Test
+    func `redirect guard blocks redirects without an original URL`() throws {
+        let redirectRequest = try URLRequest(url: #require(URL(string: "https://provider.example/usage/next")))
+
+        let guarded = ProviderHTTPRedirectGuardDelegate.guardedRedirectRequest(
+            originalURL: nil,
+            redirectRequest: redirectRequest)
+
+        #expect(guarded == nil)
+    }
+
+    @Test
+    func `redirect guard blocks port changes`() throws {
+        let redirectRequest = try URLRequest(url: #require(URL(string: "https://provider.example:8443/usage")))
+
+        let guarded = ProviderHTTPRedirectGuardDelegate.guardedRedirectRequest(
+            originalURL: URL(string: "https://provider.example/usage"),
+            redirectRequest: redirectRequest)
+
+        #expect(guarded == nil)
+    }
+
+    @Test
+    func `redirect guard preserves same origin HTTPS requests`() throws {
+        var redirectRequest = try URLRequest(url: #require(URL(string: "https://provider.example/usage/next")))
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "Cookie")
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "Authorization")
+        redirectRequest.setValue("[REDACTED]", forHTTPHeaderField: "x-api-key")
+        redirectRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let guarded = try #require(ProviderHTTPRedirectGuardDelegate.guardedRedirectRequest(
+            originalURL: URL(string: "https://provider.example/usage"),
+            redirectRequest: redirectRequest))
+
+        #expect(guarded.value(forHTTPHeaderField: "Cookie") == "[REDACTED]")
+        #expect(guarded.value(forHTTPHeaderField: "Authorization") == "[REDACTED]")
+        #expect(guarded.value(forHTTPHeaderField: "x-api-key") == "[REDACTED]")
+        #expect(guarded.value(forHTTPHeaderField: "Accept") == "application/json")
+    }
+}
+
+private final class RedirectProofURLProtocol: URLProtocol {
+    static let destination = LockIsolated<URL?>(nil)
+    static let requests = LockIsolated<[URLRequest]>([])
+
+    override static func canInit(with request: URLRequest) -> Bool {
+        request.url?.host?.hasSuffix(".invalid") == true
+    }
+
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.requests.setValue(Self.requests.value + [self.request])
+        guard let url = self.request.url else { return }
+        if url.path == "/start", let destination = Self.destination.value {
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: 302,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": destination.absoluteString])!
+            var redirect = self.request
+            redirect.url = destination
+            self.client?.urlProtocol(self, wasRedirectedTo: redirect, redirectResponse: response)
+            return
+        } else {
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: Data("ok".utf8))
+        }
+        self.client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+extension ProviderHTTPRetryPolicy {
+    fileprivate static let testOneRetry = ProviderHTTPRetryPolicy(
+        maxRetries: 1,
+        baseDelaySeconds: 0,
+        maxDelaySeconds: 0)
+}
+
+private actor ScriptedHTTPTransport: ProviderHTTPTransport {
+    enum Result {
+        case success(Int)
+        case failure(URLError)
+    }
+
+    private var results: [Result]
+    private var requests: [URLRequest] = []
+
+    init(statusCodes: [Int]) {
+        self.results = statusCodes.map(Result.success)
+    }
+
+    init(results: [Result]) {
+        self.results = results
+    }
+
+    func requestCount() -> Int {
+        self.requests.count
+    }
+
+    func data(for request: URLRequest) throws -> (Data, URLResponse) {
+        self.requests.append(request)
+        let next = self.results.isEmpty ? .success(200) : self.results.removeFirst()
+        switch next {
+        case let .success(statusCode):
+            let response = HTTPURLResponse(
+                url: request.url ?? URL(string: "https://example.com")!,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: nil)!
+            return (Data(#"{"ok":true}"#.utf8), response)
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+
+final class StubURLProtocol: URLProtocol {
+    private static let _handlerBox = LockIsolated<((URLRequest) throws -> (Data, URLResponse))?>(nil)
+    static var handler: ((URLRequest) throws -> (Data, URLResponse))? {
+        get { Self._handlerBox.value }
+        set { Self._handlerBox.setValue(newValue) }
+    }
+
+    nonisolated(unsafe) static var requests: [URLRequest] = []
+
+    override static func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            self.client?.urlProtocol(self, didFailWithError: URLError(.cannotLoadFromNetwork))
+            return
+        }
+
+        do {
+            let (data, response) = try handler(self.request)
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: data)
+            self.client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            self.client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}

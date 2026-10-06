@@ -15,38 +15,19 @@ extension SettingsStore {
     }
 
     var minimaxCookieHeader: String {
-        get { self.configSnapshot.providerConfig(for: .minimax)?.sanitizedCookieHeader ?? "" }
-        set {
-            self.updateProviderConfig(provider: .minimax) { entry in
-                entry.cookieHeader = self.normalizedConfigValue(newValue)
-            }
-            self.logSecretUpdate(provider: .minimax, field: "cookieHeader", value: newValue)
-        }
+        get { self[providerConfig: .minimax, field: .cookieHeader] }
+        set { self[providerConfig: .minimax, field: .cookieHeader] = newValue }
     }
 
     var minimaxAPIToken: String {
-        get { self.configSnapshot.providerConfig(for: .minimax)?.sanitizedAPIKey ?? "" }
-        set {
-            self.updateProviderConfig(provider: .minimax) { entry in
-                entry.apiKey = self.normalizedConfigValue(newValue)
-            }
-            self.logSecretUpdate(provider: .minimax, field: "apiKey", value: newValue)
-        }
+        get { self[providerConfig: .minimax, field: .apiKey] }
+        set { self[providerConfig: .minimax, field: .apiKey] = newValue }
     }
 
     var minimaxCookieSource: ProviderCookieSource {
         get { self.resolvedCookieSource(provider: .minimax, fallback: .auto) }
-        set {
-            self.updateProviderConfig(provider: .minimax) { entry in
-                entry.cookieSource = newValue
-            }
-            self.logProviderModeChange(provider: .minimax, field: "cookieSource", value: newValue.rawValue)
-        }
+        set { self.setCookieSource(newValue, provider: .minimax) }
     }
-
-    func ensureMiniMaxCookieLoaded() {}
-
-    func ensureMiniMaxAPITokenLoaded() {}
 
     func minimaxAuthMode(
         environment: [String: String] = ProcessInfo.processInfo.environment) -> MiniMaxAuthMode
@@ -60,37 +41,14 @@ extension SettingsStore {
 extension SettingsStore {
     func minimaxSettingsSnapshot(tokenOverride: TokenAccountOverride?) -> ProviderSettingsSnapshot
     .MiniMaxProviderSettings {
-        ProviderSettingsSnapshot.MiniMaxProviderSettings(
-            cookieSource: self.minimaxSnapshotCookieSource(tokenOverride: tokenOverride),
-            manualCookieHeader: self.minimaxSnapshotCookieHeader(tokenOverride: tokenOverride),
-            apiRegion: self.minimaxAPIRegion)
-    }
-
-    private func minimaxSnapshotCookieHeader(tokenOverride: TokenAccountOverride?) -> String {
-        let fallback = self.minimaxCookieHeader
-        guard let support = TokenAccountSupportCatalog.support(for: .minimax),
-              case .cookieHeader = support.injection
-        else {
-            return fallback
-        }
-        guard let account = ProviderTokenAccountSelection.selectedAccount(
+        let cookieSettings: ProviderSettingsSnapshot.CookieProviderSettings = self.resolvedCookieSettings(
             provider: .minimax,
-            settings: self,
-            override: tokenOverride)
-        else {
-            return fallback
-        }
-        return TokenAccountSupportCatalog.normalizedCookieHeader(account.token, support: support)
-    }
-
-    private func minimaxSnapshotCookieSource(tokenOverride: TokenAccountOverride?) -> ProviderCookieSource {
-        let fallback = self.minimaxCookieSource
-        guard let support = TokenAccountSupportCatalog.support(for: .minimax),
-              support.requiresManualCookieSource
-        else {
-            return fallback
-        }
-        if self.tokenAccounts(for: .minimax).isEmpty { return fallback }
-        return .manual
+            configuredSource: self.minimaxCookieSource,
+            configuredHeader: self.minimaxCookieHeader,
+            tokenOverride: tokenOverride)
+        return ProviderSettingsSnapshot.MiniMaxProviderSettings(
+            cookieSource: cookieSettings.cookieSource,
+            manualCookieHeader: cookieSettings.manualCookieHeader,
+            apiRegion: self.minimaxAPIRegion)
     }
 }

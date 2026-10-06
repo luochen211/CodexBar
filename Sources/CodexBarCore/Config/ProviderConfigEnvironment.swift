@@ -6,24 +6,19 @@ public enum ProviderConfigEnvironment {
         provider: UsageProvider,
         config: ProviderConfig?) -> [String: String]
     {
-        guard let apiKey = config?.sanitizedAPIKey, !apiKey.isEmpty else { return base }
-        var env = base
-        switch provider {
-        case .zai:
-            env[ZaiSettingsReader.apiTokenKey] = apiKey
-        case .copilot:
-            env["COPILOT_API_TOKEN"] = apiKey
-        case .minimax:
-            env[MiniMaxAPISettingsReader.apiTokenKey] = apiKey
-        case .kimik2:
-            if let key = KimiK2SettingsReader.apiKeyEnvironmentKeys.first {
-                env[key] = apiKey
-            }
-        case .synthetic:
-            env[SyntheticSettingsReader.apiKeyKey] = apiKey
-        default:
-            break
-        }
-        return env
+        ProviderDescriptorRegistry.descriptor(for: provider).credentials?.applyConfig(base: base, config: config)
+            ?? base
+    }
+
+    public static func supportsAPIKeyOverride(for provider: UsageProvider) -> Bool {
+        ProviderDescriptorRegistry.descriptor(for: provider).credentials?.supportsAPIKeyOverride ?? false
+    }
+
+    public static func applyProviderConfigOverrides(
+        base: [String: String],
+        provider: UsageProvider,
+        config: ProviderConfig?) -> [String: String]
+    {
+        self.applyAPIKeyOverride(base: base, provider: provider, config: config)
     }
 }

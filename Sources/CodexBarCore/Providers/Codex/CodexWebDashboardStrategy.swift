@@ -9,26 +9,47 @@ public struct CodexWebDashboardStrategy: ProviderFetchStrategy {
     public init() {}
 
     public func isAvailable(_ context: ProviderFetchContext) async -> Bool {
-        context.sourceMode.usesWeb
+        context.sourceMode.usesWeb &&
+            !Self.managedAccountStoreIsUnreadable(context) &&
+            !Self.managedAccountTargetIsUnavailable(context) &&
+            (!Self.profileAccountTargetIsUnavailable(context) || context.sourceMode == .web)
     }
 
     public func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
+        guard !Self.managedAccountStoreIsUnreadable(context) else {
+            // A fail-closed placeholder CODEX_HOME does not identify a target account. If the managed store
+            // itself is unreadable, web import must not fall back to "any signed-in browser account".
+            throw OpenAIDashboardFetcher.FetchError.loginRequired
+        }
+        guard !Self.managedAccountTargetIsUnavailable(context) else {
+            // If the selected managed account no longer exists in a readable store, web import must not
+            // fall back to "any signed-in browser account" for that stale selection.
+            throw OpenAIDashboardFetcher.FetchError.loginRequired
+        }
+        guard !Self.profileAccountTargetIsUnavailable(context) else {
+            // A profile without an auth-backed email cannot safely target browser cookie import.
+            throw OpenAIDashboardFetcher.FetchError.loginRequired
+        }
+
+        let options = OpenAIWebOptions(
+            deadline: OpenAIDashboardFetcher.deadline(startingAt: Date(), timeout: context.webTimeout),
+            debugDumpHTML: context.webDebugDumpHTML,
+            verbose: context.verbose)
+
         // Ensure AppKit is initialized before using WebKit in a CLI.
         await MainActor.run {
             _ = NSApplication.shared
         }
 
-        let accountEmail = context.fetcher.loadAccountInfo().email?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let options = OpenAIWebOptions(
-            timeout: context.webTimeout,
-            debugDumpHTML: context.webDebugDumpHTML,
-            verbose: context.verbose)
-        let result = try await Self.fetchOpenAIWebCodex(
-            accountEmail: accountEmail,
-            fetcher: context.fetcher,
-            options: options,
-            browserDetection: context.browserDetection)
+        let result: OpenAIWebCodexResult
+        do {
+            result = try await Self.fetchOpenAIWebCodex(
+                context: context,
+                options: options,
+                browserDetection: context.browserDetection)
+        } catch let error as URLError where error.code == .timedOut {
+            throw OpenAIWebCodexError.timedOut(seconds: context.webTimeout)
+        }
         return self.makeResult(
             usage: result.usage,
             credits: result.credits,
@@ -37,31 +58,74 @@ public struct CodexWebDashboardStrategy: ProviderFetchStrategy {
     }
 
     public func shouldFallback(on error: Error, context: ProviderFetchContext) -> Bool {
-        guard context.sourceMode == .auto else { return false }
         _ = error
-        return true
+        return context.sourceMode == .auto
+    }
+
+    private static func managedAccountStoreIsUnreadable(_ context: ProviderFetchContext) -> Bool {
+        context.settings?.codex?.managedAccountStoreUnreadable == true
+    }
+
+    private static func managedAccountTargetIsUnavailable(_ context: ProviderFetchContext) -> Bool {
+        context.settings?.codex?.managedAccountTargetUnavailable == true
+    }
+
+    private static func profileAccountTargetIsUnavailable(_ context: ProviderFetchContext) -> Bool {
+        context.settings?.codex?.profileAccountTargetUnavailable == true
     }
 }
 
-private struct OpenAIWebCodexResult: Sendable {
+struct OpenAIWebCodexResult {
     let usage: UsageSnapshot
     let credits: CreditsSnapshot?
     let dashboard: OpenAIDashboardSnapshot
 }
 
-private enum OpenAIWebCodexError: LocalizedError {
+enum OpenAIWebCodexError: LocalizedError, Equatable {
     case missingUsage
+    case policyRejected(CodexDashboardAuthorityDecision)
+    case timedOut(seconds: TimeInterval)
 
     var errorDescription: String? {
         switch self {
         case .missingUsage:
-            "OpenAI web dashboard did not include usage limits."
+            return "OpenAI web dashboard did not include usage limits."
+        case let .timedOut(seconds):
+            return "OpenAI web dashboard fetch timed out after \(seconds.formatted()) seconds."
+        case let .policyRejected(decision):
+            switch decision.reason {
+            case let .wrongEmail(expected, actual):
+                var details: [String] = []
+                if let expected {
+                    details.append("expected \(expected)")
+                }
+                if let actual {
+                    details.append("got \(actual)")
+                }
+                if details.isEmpty {
+                    return "OpenAI web dashboard belonged to the wrong account."
+                }
+                return "OpenAI web dashboard belonged to the wrong account (\(details.joined(separator: ", ")))."
+            case .unresolvedWithoutTrustedEvidence:
+                return "Active Codex identity is unresolved and no trusted auth-backed continuity exists."
+            case .providerAccountMissingScopedEmail:
+                return "Active Codex provider account is missing its scoped email, " +
+                    "so dashboard ownership cannot be proven."
+            case .providerAccountLacksExactOwnershipProof:
+                return "OpenAI web dashboard could not be proven to belong to the active provider account."
+            case .missingDashboardSignedInEmail:
+                return "OpenAI web dashboard did not expose a signed-in email."
+            case let .sameEmailAmbiguity(email):
+                return "OpenAI web dashboard email \(email) is ambiguous across multiple known owners."
+            default:
+                return "OpenAI web dashboard was rejected by Codex dashboard authority."
+            }
         }
     }
 }
 
-private struct OpenAIWebOptions: Sendable {
-    let timeout: TimeInterval
+private struct OpenAIWebOptions {
+    let deadline: Date
     let debugDumpHTML: Bool
     let verbose: Bool
 }
@@ -71,7 +135,8 @@ private final class WebLogBuffer {
     private var lines: [String] = []
     private let maxCount: Int
     private let verbose: Bool
-    private let logger = CodexBarLog.logger(LogCategories.openAIWeb)
+    /// Provider-specific by design: The Codex dashboard strategy logs its OpenAI web integration separately.
+    private let logger = CodexBarLog.logger(LogCategories.provider(.openai, scope: "web"))
 
     init(maxCount: Int = 300, verbose: Bool) {
         self.maxCount = maxCount
@@ -96,8 +161,7 @@ private final class WebLogBuffer {
 extension CodexWebDashboardStrategy {
     @MainActor
     fileprivate static func fetchOpenAIWebCodex(
-        accountEmail: String?,
-        fetcher: UsageFetcher,
+        context: ProviderFetchContext,
         options: OpenAIWebOptions,
         browserDetection: BrowserDetection) async throws -> OpenAIWebCodexResult
     {
@@ -105,47 +169,182 @@ extension CodexWebDashboardStrategy {
         let log: @MainActor (String) -> Void = { line in
             logger.append(line)
         }
-        let dashboard = try await Self.fetchOpenAIWebDashboard(
-            accountEmail: accountEmail,
-            fetcher: fetcher,
-            options: options,
-            browserDetection: browserDetection,
-            logger: log)
-        guard let usage = dashboard.toUsageSnapshot(provider: .codex, accountEmail: accountEmail) else {
-            throw OpenAIWebCodexError.missingUsage
+        do {
+            let result = try await Self.fetchOpenAIWebDashboard(
+                context: context,
+                options: options,
+                browserDetection: browserDetection,
+                preferCachedCookieHeader: true,
+                logger: log)
+            return try Self.makeAuthorizedDashboardResult(
+                dashboard: result.dashboard,
+                context: context,
+                routingTargetEmail: result.routingTargetEmail)
+        } catch {
+            guard Self.shouldRetryWithFreshBrowserImport(after: error) else {
+                throw error
+            }
+            _ = try OpenAIDashboardBrowserCookieImporter.remainingTimeout(until: options.deadline)
+            log("Retrying OpenAI web dashboard with a fresh browser cookie import.")
+            let result = try await Self.fetchOpenAIWebDashboard(
+                context: context,
+                options: options,
+                browserDetection: browserDetection,
+                preferCachedCookieHeader: false,
+                logger: log)
+            return try Self.makeAuthorizedDashboardResult(
+                dashboard: result.dashboard,
+                context: context,
+                routingTargetEmail: result.routingTargetEmail)
         }
-        let credits = dashboard.toCreditsSnapshot()
-        return OpenAIWebCodexResult(usage: usage, credits: credits, dashboard: dashboard)
+    }
+
+    nonisolated static func shouldRetryWithFreshBrowserImport(after error: Error) -> Bool {
+        if error is OpenAIWebCodexError {
+            return error as? OpenAIWebCodexError == .missingUsage
+        }
+        if case OpenAIDashboardFetcher.FetchError.noDashboardData = error {
+            return true
+        }
+        return false
     }
 
     @MainActor
-    fileprivate static func fetchOpenAIWebDashboard(
-        accountEmail: String?,
-        fetcher: UsageFetcher,
+    static func makeAuthorizedDashboardResultForTesting(
+        dashboard: OpenAIDashboardSnapshot,
+        context: ProviderFetchContext,
+        routingTargetEmail: String?)
+        throws -> OpenAIWebCodexResult
+    {
+        try self.makeAuthorizedDashboardResult(
+            dashboard: dashboard,
+            context: context,
+            routingTargetEmail: routingTargetEmail)
+    }
+
+    @MainActor
+    private static func makeAuthorizedDashboardResult(
+        dashboard: OpenAIDashboardSnapshot,
+        context: ProviderFetchContext,
+        routingTargetEmail: String?) throws -> OpenAIWebCodexResult
+    {
+        let input = CodexCLIDashboardAuthorityContext.makeLiveWebInput(
+            dashboard: dashboard,
+            context: context,
+            routingTargetEmail: routingTargetEmail)
+        let decision = CodexDashboardAuthority.evaluate(input)
+
+        switch decision.disposition {
+        case .attach:
+            let attachedAccountEmail = CodexCLIDashboardAuthorityContext.attachmentEmail(from: input)
+            let credits = dashboard.toCreditsSnapshot()
+            let usage = dashboard.toUsageSnapshot(provider: .codex, accountEmail: attachedAccountEmail)
+                ?? Self.makeCreditsOnlyUsageSnapshot(
+                    dashboard: dashboard,
+                    attachedAccountEmail: attachedAccountEmail,
+                    credits: credits)
+            guard let usage else {
+                throw OpenAIWebCodexError.missingUsage
+            }
+            if let attachedAccountEmail {
+                OpenAIDashboardCacheStore.save(OpenAIDashboardCache(
+                    accountEmail: attachedAccountEmail,
+                    snapshot: dashboard))
+            }
+            return OpenAIWebCodexResult(
+                usage: CodexExtraUsageCost.attaching(to: usage, credits: credits),
+                credits: credits,
+                dashboard: dashboard)
+        case .displayOnly:
+            if decision.cleanup.contains(.dashboardCache) {
+                OpenAIDashboardCacheStore.clear()
+            }
+            throw CodexDashboardPolicyError.displayOnly(decision)
+        case .failClosed:
+            if decision.cleanup.contains(.dashboardCache) {
+                OpenAIDashboardCacheStore.clear()
+            }
+            throw OpenAIWebCodexError.policyRejected(decision)
+        }
+    }
+
+    private static func makeCreditsOnlyUsageSnapshot(
+        dashboard: OpenAIDashboardSnapshot,
+        attachedAccountEmail: String?,
+        credits: CreditsSnapshot?) -> UsageSnapshot?
+    {
+        guard credits != nil else { return nil }
+        return UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            tertiary: nil,
+            updatedAt: dashboard.updatedAt,
+            identity: ProviderIdentitySnapshot(
+                providerID: .codex,
+                accountEmail: attachedAccountEmail ?? dashboard.signedInEmail,
+                accountOrganization: nil,
+                loginMethod: dashboard.accountPlan))
+    }
+
+    private struct OpenAIWebDashboardFetchResult {
+        let dashboard: OpenAIDashboardSnapshot
+        let routingTargetEmail: String?
+    }
+
+    @MainActor
+    private static func fetchOpenAIWebDashboard(
+        context: ProviderFetchContext,
         options: OpenAIWebOptions,
         browserDetection: BrowserDetection,
-        logger: @MainActor @escaping (String) -> Void) async throws -> OpenAIDashboardSnapshot
+        preferCachedCookieHeader: Bool,
+        logger: @MainActor @escaping (String) -> Void) async throws -> OpenAIWebDashboardFetchResult
     {
-        let trimmed = accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallback = fetcher.loadAccountInfo().email?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let codexEmail = trimmed?.isEmpty == false ? trimmed : (fallback?.isEmpty == false ? fallback : nil)
-        let allowAnyAccount = codexEmail == nil
+        let auth = context.fetcher.loadAuthBackedCodexAccount()
+        let routingTargetEmail = auth.email?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowAnyAccount = routingTargetEmail == nil
 
         let importResult = try await OpenAIDashboardBrowserCookieImporter(browserDetection: browserDetection)
-            .importBestCookies(intoAccountEmail: codexEmail, allowAnyAccount: allowAnyAccount, logger: logger)
-        let effectiveEmail = codexEmail ?? importResult.signedInEmail?
+            .importBestCookies(
+                intoAccountEmail: routingTargetEmail,
+                allowAnyAccount: allowAnyAccount,
+                preferCachedCookieHeader: preferCachedCookieHeader,
+                cacheScope: context.settings?.codex?.openAIWebCacheScope,
+                deadline: options.deadline,
+                logger: logger)
+        let effectiveEmail = routingTargetEmail ?? importResult.signedInEmail?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let dash = try await OpenAIDashboardFetcher().loadLatestDashboard(
+        let dashboard = try await OpenAIDashboardFetcher().loadLatestDashboard(
             accountEmail: effectiveEmail,
+            cacheScope: context.settings?.codex?.openAIWebCacheScope,
             logger: logger,
             debugDumpHTML: options.debugDumpHTML,
-            timeout: options.timeout)
-        let cacheEmail = effectiveEmail ?? dash.signedInEmail?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let cacheEmail, !cacheEmail.isEmpty {
-            OpenAIDashboardCacheStore.save(OpenAIDashboardCache(accountEmail: cacheEmail, snapshot: dash))
+            timeout: OpenAIDashboardBrowserCookieImporter.remainingTimeout(until: options.deadline))
+        try Task.checkCancellation()
+        let remainingTimeout = OpenAIDashboardFetcher.remainingTimeout(until: options.deadline)
+        let subscriptionResult: OpenAISubscriptionFetchResult = if remainingTimeout > 0 {
+            await OpenAIDashboardFetcher().fetchSubscriptionMetadata(
+                accountEmail: effectiveEmail,
+                cacheScope: context.settings?.codex?.openAIWebCacheScope,
+                logger: logger,
+                timeout: min(8, remainingTimeout))
+        } else {
+            .unavailable
         }
-        return dash
+        try Task.checkCancellation()
+        return OpenAIWebDashboardFetchResult(
+            dashboard: Self.dashboardByMergingSubscriptionMetadata(
+                dashboard,
+                result: subscriptionResult),
+            routingTargetEmail: routingTargetEmail)
+    }
+
+    static func dashboardByMergingSubscriptionMetadata(
+        _ dashboard: OpenAIDashboardSnapshot,
+        result: OpenAISubscriptionFetchResult) -> OpenAIDashboardSnapshot
+    {
+        guard result.succeeded else { return dashboard }
+        return dashboard.withSubscriptionMetadata(result.metadata)
     }
 }
 #else

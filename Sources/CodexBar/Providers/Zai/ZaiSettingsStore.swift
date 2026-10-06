@@ -15,20 +15,43 @@ extension SettingsStore {
     }
 
     var zaiAPIToken: String {
-        get { self.configSnapshot.providerConfig(for: .zai)?.sanitizedAPIKey ?? "" }
-        set {
-            self.updateProviderConfig(provider: .zai) { entry in
-                entry.apiKey = self.normalizedConfigValue(newValue)
-            }
-            self.logSecretUpdate(provider: .zai, field: "apiKey", value: newValue)
-        }
+        get { self[providerConfig: .zai, field: .apiKey] }
+        set { self[providerConfig: .zai, field: .apiKey] = newValue }
     }
-
-    func ensureZaiAPITokenLoaded() {}
 }
 
 extension SettingsStore {
-    func zaiSettingsSnapshot() -> ProviderSettingsSnapshot.ZaiProviderSettings {
-        ProviderSettingsSnapshot.ZaiProviderSettings(apiRegion: self.zaiAPIRegion)
+    func zaiSettingsSnapshot(
+        tokenOverride: TokenAccountOverride? = nil) -> ProviderSettingsSnapshot.ZaiProviderSettings
+    {
+        let usageScope = self.zaiEffectiveUsageScope(tokenOverride: tokenOverride)
+        let account = ProviderTokenAccountSelection.selectedAccount(
+            provider: .zai,
+            settings: self,
+            override: tokenOverride)
+        let teamContext: ZaiBigModelTeamContext? = if usageScope == .team {
+            ZaiBigModelTeamContext(
+                organizationID: account?.sanitizedOrganizationID,
+                projectID: account?.sanitizedWorkspaceID)
+        } else {
+            nil
+        }
+        return ProviderSettingsSnapshot.ZaiProviderSettings(
+            apiRegion: self.zaiAPIRegion,
+            usageScope: usageScope,
+            teamContext: teamContext)
+    }
+
+    func zaiEffectiveUsageScope(tokenOverride: TokenAccountOverride? = nil) -> ZaiUsageScope {
+        let account = ProviderTokenAccountSelection.selectedAccount(
+            provider: .zai,
+            settings: self,
+            override: tokenOverride)
+        return Self.zaiUsageScope(from: account) ?? .personal
+    }
+
+    private static func zaiUsageScope(from account: ProviderTokenAccount?) -> ZaiUsageScope? {
+        guard let raw = account?.sanitizedUsageScope?.lowercased() else { return nil }
+        return ZaiUsageScope(rawValue: raw)
     }
 }

@@ -1,9 +1,6 @@
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
-import SwiftUI
 
-@ProviderImplementationRegistration
 struct JetBrainsProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .jetbrains
 
@@ -30,7 +27,7 @@ struct JetBrainsProviderImplementation: ProviderImplementation {
                 id: "jetbrains.ide",
                 title: "JetBrains IDE",
                 subtitle: "Select the IDE to monitor",
-                binding: context.stringBinding(\.jetbrainsIDEBasePath),
+                binding: context.binding(\.jetbrainsIDEBasePath),
                 options: options,
                 isVisible: nil,
                 onChange: nil,
@@ -54,13 +51,12 @@ struct JetBrainsProviderImplementation: ProviderImplementation {
                 subtitle: "Override auto-detection with a custom IDE base path",
                 kind: .plain,
                 placeholder: "~/Library/Application Support/JetBrains/IntelliJIdea2024.3",
-                binding: context.stringBinding(\.jetbrainsIDEBasePath),
+                binding: context.binding(\.jetbrainsIDEBasePath),
                 actions: [],
                 isVisible: {
                     let detectedIDEs = JetBrainsIDEDetector.detectInstalledIDEs()
                     return detectedIDEs.isEmpty || !context.settings.jetbrainsIDEBasePath.isEmpty
-                },
-                onActivate: nil),
+                }),
         ]
     }
 

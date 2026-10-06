@@ -2,195 +2,465 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
-@Suite
-struct ZaiSettingsReaderTests {
-    @Test
-    func apiTokenReadsFromEnvironment() {
-        let token = ZaiSettingsReader.apiToken(environment: ["Z_AI_API_KEY": "abc123"])
-        #expect(token == "abc123")
+struct ZaiProviderTests {
+    @Test(arguments: BundledPluginTestSupport.engines, [
+        "",
+        #"{"type":"FUTURE_LIMIT","unit":3,"number":5,"percentage":40}"#,
+        #"{"type":"FUTURE_POINTS_POOL","pointsRemaining":800}"#,
+    ])
+    func `missing recognized limits never fabricate unused quota`(
+        engine: ProviderPluginEngineKind,
+        limits: String) async throws
+    {
+        let fixture = #"""
+        {"code":200,"success":true,"data":{"planName":"Pro","limits":[\#(limits)]}}
+        """#
+        for analytics in [Self.emptyModelUsageFixture, Self.modelUsageFixture] {
+            let snapshot = try await Self.pluginSnapshot(
+                quotaFixture: fixture, modelUsageFixture: analytics, engine: engine)
+            #expect(snapshot.primary == nil)
+            #expect(snapshot.secondary == nil)
+            #expect(snapshot.extraRateWindows?.isEmpty != false)
+            #expect(snapshot.identity?.loginMethod == "Pro")
+            #expect(snapshot.detailRow(label: "Coding Plan usage")?.value == "Unavailable")
+            #expect(snapshot.detailRow(label: "Coding Plan usage")?.secondaryValue?.contains("Usage Dashboard") == true)
+            #expect(snapshot.details.map(\.title) == (analytics == Self.emptyModelUsageFixture
+                    ? ["Quota details"] : ["Quota details", "Hourly tokens", "Daily tokens"]))
+        }
     }
 
-    @Test
-    func apiTokenStripsQuotes() {
-        let token = ZaiSettingsReader.apiToken(environment: ["Z_AI_API_KEY": "\"token-xyz\""])
-        #expect(token == "token-xyz")
+    @Test(arguments: BundledPluginTestSupport.engines, ["TOKENS_LIMIT", "CREDIT_LIMIT", "TIME_LIMIT"])
+    func `explicit zero usage remains a real quota window`(
+        engine: ProviderPluginEngineKind,
+        limitType: String) async throws
+    {
+        let fixture = #"""
+        {"code":200,"success":true,"data":{"limits":[
+          {"type":"\#(limitType)","unit":3,"number":5,"percentage":0}
+        ]}}
+        """#
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: fixture, engine: engine)
+        #expect(snapshot.primary?.usedPercent == 0)
+        #expect(snapshot.primary?.windowMinutes == 300)
+        #expect(snapshot.secondary == nil)
+        #expect(snapshot.detailRow(label: "Coding Plan usage") == nil)
     }
 
-    @Test
-    func apiHostReadsFromEnvironment() {
-        let host = ZaiSettingsReader.apiHost(environment: [ZaiSettingsReader.apiHostKey: " open.bigmodel.cn "])
-        #expect(host == "open.bigmodel.cn")
+    @Test(arguments: BundledPluginTestSupport.engines)
+    func `unsupported plan pool preserves known MCP without implying Coding Plan availability`(
+        engine: ProviderPluginEngineKind) async throws
+    {
+        let fixture = #"""
+        {"code":200,"success":true,"data":{"limits":[
+          {"type":"FUTURE_POINTS_POOL","pointsRemaining":800},
+          {"type":"TIME_LIMIT","unit":5,"number":1,"percentage":25}
+        ]}}
+        """#
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: fixture, engine: engine)
+        #expect(snapshot.primary?.resetDescription == "MCP")
+        #expect(snapshot.primary?.usedPercent == 25)
+        #expect(snapshot.detailRow(label: "Coding Plan usage")?.value == "Unavailable")
     }
 
-    @Test
-    func quotaURLInfersScheme() {
-        let url = ZaiSettingsReader
-            .quotaURL(environment: [ZaiSettingsReader.quotaURLKey: "open.bigmodel.cn/api/coding"])
-        #expect(url?.absoluteString == "https://open.bigmodel.cn/api/coding")
+    @Test(arguments: BundledPluginTestSupport.engines)
+    func `unknown extra limits do not mark recognized Coding Plan usage unavailable`(
+        engine: ProviderPluginEngineKind) async throws
+    {
+        let fixture = #"""
+        {"code":200,"success":true,"data":{"limits":[
+          {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":25},
+          {"type":"FUTURE_POINTS_POOL","pointsRemaining":800}
+        ]}}
+        """#
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: fixture, engine: engine)
+        #expect(snapshot.primary?.usedPercent == 25)
+        #expect(snapshot.detailRow(label: "Coding Plan usage") == nil)
+        #expect(snapshot.detailRow(label: "Additional quota")?.value == "Unavailable")
     }
-}
 
-@Suite
-struct ZaiUsageSnapshotTests {
-    @Test
-    func mapsUsageSnapshotWindows() {
-        let reset = Date(timeIntervalSince1970: 123)
-        let tokenLimit = ZaiLimitEntry(
-            type: .tokensLimit,
-            unit: .hours,
-            number: 5,
-            usage: 100,
-            currentValue: 20,
-            remaining: 80,
-            percentage: 25,
-            usageDetails: [],
-            nextResetTime: reset)
-        let timeLimit = ZaiLimitEntry(
-            type: .timeLimit,
-            unit: .days,
-            number: 30,
-            usage: 200,
-            currentValue: 40,
-            remaining: 160,
-            percentage: 50,
-            usageDetails: [],
-            nextResetTime: nil)
-        let snapshot = ZaiUsageSnapshot(
-            tokenLimit: tokenLimit,
-            timeLimit: timeLimit,
-            planName: nil,
-            updatedAt: reset)
-
-        let usage = snapshot.toUsageSnapshot()
-
-        #expect(usage.primary?.usedPercent == 20)
-        #expect(usage.primary?.windowMinutes == 300)
-        #expect(usage.primary?.resetsAt == reset)
-        #expect(usage.primary?.resetDescription == "5 hours window")
-        #expect(usage.secondary?.usedPercent == 20)
-        #expect(usage.secondary?.resetDescription == "30 days window")
-        #expect(usage.zaiUsage?.tokenLimit?.usage == 100)
+    @Test(arguments: BundledPluginTestSupport.engines, [
+        #"{"pointsPool":{"remaining":800}}"#,
+        #"{"limits":[{"unit":3,"number":5,"percentage":25}]}"#,
+        #"{"limits":[{"type":null,"unit":3,"number":5,"percentage":25}]}"#,
+        #"{"limits":[{"type":42,"unit":3,"number":5,"percentage":25}]}"#,
+    ])
+    func `unsupported quota shapes explain where to check usage`(
+        engine: ProviderPluginEngineKind,
+        data: String) async
+    {
+        do {
+            _ = try await Self.pluginSnapshot(
+                quotaFixture: #"{"code":200,"success":true,"data":\#(data)}"#,
+                engine: engine)
+            Issue.record("An unsupported quota envelope must not invent usage")
+        } catch {
+            #expect(error.localizedDescription.contains("Usage Dashboard"))
+        }
     }
-}
 
-@Suite
-struct ZaiUsageParsingTests {
-    @Test
-    func parsesUsageResponse() throws {
-        let json = """
-        {
-          "code": 200,
-          "msg": "Operation successful",
-          "data": {
-            "limits": [
-              {
-                "type": "TIME_LIMIT",
-                "unit": 5,
-                "number": 1,
-                "usage": 100,
-                "currentValue": 102,
-                "remaining": 0,
-                "percentage": 100,
-                "usageDetails": [
-                  { "modelCode": "search-prime", "usage": 95 }
-                ]
-              },
-              {
-                "type": "TOKENS_LIMIT",
-                "unit": 3,
-                "number": 5,
-                "usage": 40000000,
-                "currentValue": 13628365,
-                "remaining": 26371635,
-                "percentage": 34,
-                "nextResetTime": 1768507567547
-              }
+    @Test(arguments: BundledPluginTestSupport.engines)
+    func `unrenderable optional analytics preserve required quota`(engine: ProviderPluginEngineKind) async throws {
+        for (count, name, label) in [
+            (121, "Example", "hour"),
+            (1, String(repeating: "x", count: 121), "hour"),
+            (1, "Example", String(repeating: "x", count: 121)),
+            (1, "  ", "hour"),
+            (1, "Example", "  "),
+            (1, "\u{0085}\u{200B}", "hour"),
+            (1, "Example", "\u{0085}\u{200B}"),
+        ] {
+            let analytics: [String: Any] = [
+                "code": 200, "success": true,
+                "data": [
+                    "x_time": Array(repeating: label, count: count),
+                    "modelDataList": [["modelName": name, "tokensUsage": Array(repeating: 1, count: count)]],
+                ],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: analytics)
+            let snapshot = try await Self.pluginSnapshot(
+                quotaFixture: Self.quotaFixture,
+                modelUsageFixture: #require(String(data: data, encoding: .utf8)),
+                engine: engine)
+            #expect(snapshot.primary?.usedPercent == 25)
+            #expect(snapshot.secondary?.usedPercent == 9)
+            #expect(snapshot.identity?.loginMethod == "Pro")
+            #expect(snapshot.details.map(\.title) == ["Quota details"])
+        }
+    }
+
+    @Test(arguments: BundledPluginTestSupport.engines, [
+        String(repeating: "x", count: 120),
+        String(repeating: "e\u{0301}", count: 120),
+        String(repeating: "👩‍👩‍👧‍👦", count: 120),
+    ])
+    func `analytics at the chart and label bounds remain complete`(
+        engine: ProviderPluginEngineKind,
+        name: String) async throws
+    {
+        let analytics: [String: Any] = [
+            "code": 200, "success": true,
+            "data": [
+                "x_time": (0..<120).map { "hour-\($0)" },
+                "modelDataList": [["modelName": name, "tokensUsage": Array(repeating: 1, count: 120)]],
             ],
-            "planName": "Pro"
-          },
-          "success": true
-        }
-        """
-
-        let snapshot = try ZaiUsageFetcher.parseUsageSnapshot(from: Data(json.utf8))
-
-        #expect(snapshot.planName == "Pro")
-        #expect(snapshot.tokenLimit?.usage == 40_000_000)
-        #expect(snapshot.timeLimit?.usageDetails.first?.modelCode == "search-prime")
-    }
-
-    @Test
-    func missingDataReturnsApiError() {
-        let json = """
-        { "code": 1001, "msg": "Authorization Token Missing", "success": false }
-        """
-
-        #expect {
-            _ = try ZaiUsageFetcher.parseUsageSnapshot(from: Data(json.utf8))
-        } throws: { error in
-            guard case let ZaiUsageError.apiError(message) = error else { return false }
-            return message == "Authorization Token Missing"
+        ]
+        let data = try JSONSerialization.data(withJSONObject: analytics)
+        let snapshot = try await Self.pluginSnapshot(
+            quotaFixture: Self.quotaFixture,
+            modelUsageFixture: #require(String(data: data, encoding: .utf8)),
+            engine: engine)
+        for title in ["Hourly tokens", "Daily tokens"] {
+            let section = try #require(snapshot.details.first { $0.title == title })
+            #expect(section.rows.first?.label == name)
+            #expect(section.rows.first?.value == "120")
+            #expect(section.chart?.points.count == 120)
         }
     }
 
-    @Test
-    func successWithoutDataReturnsParseFailed() {
-        let json = """
-        { "code": 200, "msg": "Operation successful", "success": true }
-        """
+    @Test(arguments: BundledPluginTestSupport.engines)
+    func `overflowing optional model aggregates preserve quota`(engine: ProviderPluginEngineKind) async throws {
+        let analytics = #"""
+        {"code":200,"success":true,"data":{"x_time":["hour"],"modelDataList":[
+          {"modelName":"Example A","tokensUsage":[1e308]},
+          {"modelName":"Example B","tokensUsage":[1e308]}
+        ]}}
+        """#
+        let snapshot = try await Self.pluginSnapshot(
+            quotaFixture: Self.quotaFixture, modelUsageFixture: analytics, engine: engine)
+        #expect(snapshot.primary?.usedPercent == 25)
+        #expect(snapshot.secondary?.usedPercent == 9)
+        #expect(snapshot.details.map(\.title) == ["Quota details"])
+    }
 
-        #expect {
-            _ = try ZaiUsageFetcher.parseUsageSnapshot(from: Data(json.utf8))
-        } throws: { error in
-            guard case let ZaiUsageError.parseFailed(message) = error else { return false }
-            return message == "Missing data"
+    @Test
+    func `settings reader preserves regional credential precedence`() {
+        #expect(ZaiSettingsReader.apiToken(environment: ["Z_AI_API_KEY": " direct-token "]) == "direct-token")
+        #expect(ZaiSettingsReader.apiToken(
+            for: .bigmodelCN,
+            environment: ["BIGMODEL_API_KEY": " china-token "],
+            homeDirectory: URL(fileURLWithPath: "/nonexistent")) == "china-token")
+        #expect(ZaiSettingsReader.apiToken(
+            for: .global,
+            environment: ["BIGMODEL_API_KEY": "china-token"],
+            homeDirectory: URL(fileURLWithPath: "/nonexistent")) == nil)
+    }
+
+    @Test
+    func `endpoint router preserves quota model and dashboard routing`() {
+        #expect(ZaiEndpointRouter.resolveQuotaURL(region: .global, environment: [:]).absoluteString ==
+            "https://api.z.ai/api/monitor/usage/quota/limit")
+        #expect(ZaiEndpointRouter.resolveModelUsageURL(region: .bigmodelCN, environment: [:]).absoluteString ==
+            "https://open.bigmodel.cn/api/monitor/usage/model-usage")
+
+        let quotaOverride = [ZaiSettingsReader.quotaURLKey: "https://zai-proxy.test/custom-quota"]
+        #expect(ZaiEndpointRouter.resolveQuotaURL(region: .global, environment: quotaOverride).absoluteString ==
+            "https://zai-proxy.test/custom-quota")
+        #expect(ZaiEndpointRouter.resolveModelUsageURL(region: .global, environment: quotaOverride).absoluteString ==
+            "https://api.z.ai/api/monitor/usage/model-usage")
+
+        let hostOverride = [ZaiSettingsReader.apiHostKey: "open.bigmodel.cn"]
+        #expect(ZaiEndpointRouter.resolveQuotaURL(region: .global, environment: hostOverride).absoluteString ==
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+        #expect(ZaiEndpointRouter.resolveDashboardURL(region: .global, environment: hostOverride) ==
+            ZaiAPIRegion.bigmodelCN.dashboardURL)
+        #expect(ZaiEndpointRouter.resolveDashboardURL(
+            region: .global,
+            environment: hostOverride,
+            usageScope: .team) == ZaiAPIRegion.bigmodelCN.teamDashboardURL)
+    }
+
+    @Test
+    func `script strategy projects validated endpoint overrides`() async throws {
+        let environment = [
+            ZaiSettingsReader.apiTokenKey: "fixture-key",
+            ZaiSettingsReader.quotaURLKey: "https://zai-proxy.test/custom-quota?keep=1&type=9",
+            ZaiSettingsReader.apiHostKey: "https://zai-proxy.test/custom-model",
+            ZaiSettingsReader.bigModelOrganizationKey: "org-fixture",
+            ZaiSettingsReader.bigModelProjectKey: "project-fixture",
+        ]
+        let settings = ProviderSettingsSnapshot.make(zai: .init(
+            apiRegion: .global,
+            usageScope: .team,
+            teamContext: nil))
+        let context = Self.context(environment: environment, settings: settings)
+        let strategy = try #require(await ZaiProviderDescriptor.descriptor.fetchPlan.pipeline
+            .resolveStrategies(context).first)
+        let requests = RequestRecorder()
+        let transport = ProviderHTTPTransportHandler { request in
+            await requests.append(request)
+            let body = request.url?.path == "/custom-quota" ? Self.quotaFixture : Self.emptyModelUsageFixture
+            return try Self.response(request: request, body: body)
+        }
+        let script = ScriptFetchStrategy(
+            id: "zai.js",
+            provider: .zai,
+            bundledPlugin: "zai",
+            secretKey: ZaiSettingsReader.apiTokenKey,
+            sourceLabel: "api",
+            transport: transport,
+            validateContext: { _ in },
+            resolveValues: { _ in
+                ScriptFetchStrategy.Values(
+                    settings: [
+                        "Z_AI_REGION": "global",
+                        "Z_AI_USAGE_SCOPE": "team",
+                        "Z_AI_ORGANIZATION": "org-fixture",
+                        "Z_AI_PROJECT": "project-fixture",
+                        "Z_AI_QUOTA_ENDPOINT": "https://zai-proxy.test/custom-quota?keep=1&type=9",
+                        "Z_AI_MODEL_USAGE_ENDPOINT": "https://zai-proxy.test/custom-model",
+                    ],
+                    secrets: [ZaiSettingsReader.apiTokenKey: "fixture-key"])
+            },
+            isEnabled: { _ in true })
+
+        _ = try await script.fetch(context)
+
+        let recorded = await requests.requests
+        let quotaRequest = try #require(recorded.first { $0.url?.path == "/custom-quota" })
+        #expect(quotaRequest.url?.query?.contains("keep=1") == true)
+        #expect(quotaRequest.url?.query?.contains("type=2") == true)
+        #expect(quotaRequest.url?.query?.contains("type=9") == false)
+        #expect(quotaRequest.value(forHTTPHeaderField: "Bigmodel-Organization") == "org-fixture")
+        #expect(quotaRequest.value(forHTTPHeaderField: "Bigmodel-Project") == "project-fixture")
+        #expect(recorded.count { $0.url?.path == "/custom-model" } == 2)
+        #expect(strategy.id == "zai.js")
+    }
+
+    @Test
+    func `strategy rejects invalid endpoints and missing team context before network`() async throws {
+        let invalidContext = Self.context(environment: [
+            ZaiSettingsReader.apiTokenKey: "fixture-key",
+            ZaiSettingsReader.apiHostKey: "http://attacker.test",
+        ])
+        let teamContext = Self.context(
+            environment: [ZaiSettingsReader.apiTokenKey: "fixture-key"],
+            settings: .make(zai: .init(usageScope: .team)))
+        let strategy = try #require(await ZaiProviderDescriptor.descriptor.fetchPlan.pipeline
+            .resolveStrategies(invalidContext).first)
+
+        await #expect(throws: ZaiSettingsError.invalidEndpointOverride(ZaiSettingsReader.apiHostKey)) {
+            _ = try await strategy.fetch(invalidContext)
+        }
+        await #expect(throws: ZaiProviderSettingsError.missingTeamContext) {
+            _ = try await strategy.fetch(teamContext)
         }
     }
 
     @Test
-    func successWithoutLimitsParsesEmptyUsage() throws {
-        let json = """
-        {
-          "code": 200,
-          "msg": "Operation successful",
-          "data": { "planName": "Pro" },
-          "success": true
+    func `plugin maps quota and model usage into stable generic details`() async throws {
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: Self.quotaFixture)
+
+        #expect(snapshot.primary?.usedPercent == 25)
+        #expect(snapshot.primary?.windowMinutes == 300)
+        #expect(snapshot.secondary?.usedPercent == 9)
+        #expect(snapshot.extraRateWindows?.first?.id == "zai-mcp")
+        #expect(snapshot.extraRateWindows?.first?.window.windowMinutes ==
+            ProviderPaceCapability.monthlyWindowSentinelMinutes)
+        #expect(snapshot.identity?.loginMethod == "Pro")
+        #expect(snapshot.details.map(\.title) == ["Quota details", "Hourly tokens", "Daily tokens"])
+    }
+
+    @Test
+    func `plugin compacts large model token totals without changing chart values`() async throws {
+        let snapshot = try await Self.pluginSnapshot(
+            quotaFixture: Self.quotaFixture,
+            modelUsageFixture: Self.largeModelUsageFixture)
+        for title in ["Hourly tokens", "Daily tokens"] {
+            let section = try #require(snapshot.details.first { $0.title == title })
+            #expect(section.rows.map(\.label) == ["Example Large", "Example Medium", "Example Small", "Example Exact"])
+            #expect(section.rows.map(\.value) == ["5.3B", "491M", "76.1M", "999999"])
+            let chart = try #require(section.chart)
+            #expect(chart.kind == .bars)
+            #expect(chart.title == title)
+            #expect(chart.unit == "tokens")
+            #expect(chart.points.map(\.label) == ["2026-08-02 08:00", "2026-08-02 09:00"])
+            #expect(chart.points.map(\.value) == [5_470_500_000, 397_699_724])
         }
-        """
+    }
 
-        let snapshot = try ZaiUsageFetcher.parseUsageSnapshot(from: Data(json.utf8))
+    @Test
+    func `plugin preserves explicit MCP duration`() async throws {
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: Self.explicitTimeLimitFixture)
 
-        #expect(snapshot.planName == "Pro")
-        #expect(snapshot.tokenLimit == nil)
-        #expect(snapshot.timeLimit == nil)
+        #expect(snapshot.extraRateWindows?.first?.window.windowMinutes == 5 * 60)
+    }
+
+    @Test
+    func `plugin leaves unknown MCP cadence unset`() async throws {
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: Self.unknownTimeLimitFixture)
+
+        #expect(snapshot.extraRateWindows?.first?.window.windowMinutes == nil)
+    }
+
+    @Test(arguments: ["TOKENS_LIMIT", "CREDIT_LIMIT"])
+    func `plugin preserves rolling 30-day limits without MCP semantics`(limitType: String) async throws {
+        let fixture = #"""
+        {"code":200,"msg":"success","success":true,"data":{"limits":[
+          {"type":"\#(limitType)","unit":1,"number":30,"percentage":50,"nextResetTime":1787112000000}
+        ]}}
+        """#
+        let snapshot = try await Self.pluginSnapshot(quotaFixture: fixture)
+
+        #expect(snapshot.primary?.windowMinutes == ProviderPaceCapability.monthlyWindowSentinelMinutes)
+        #expect(snapshot.primary?.resetDescription == "30 days window")
+    }
+
+    @Test
+    func `provider metadata keeps regional dashboards`() {
+        let descriptor = ProviderDescriptorRegistry.descriptor(for: .zai)
+        #expect(descriptor.metadata.displayName == "z.ai / GLM")
+        #expect(descriptor.metadata.dashboardURL == ZaiAPIRegion.global.dashboardURL.absoluteString)
+        #expect(ZaiAPIRegion.bigmodelCN.teamDashboardURL.absoluteString ==
+            "https://bigmodel.cn/coding-plan/team/usage-stats")
+    }
+
+    private static func context(
+        environment: [String: String],
+        settings: ProviderSettingsSnapshot? = nil) -> ProviderFetchContext
+    {
+        ProviderFetchContext(
+            runtime: .app,
+            sourceMode: .api,
+            includeCredits: false,
+            webTimeout: 1,
+            webDebugDumpHTML: false,
+            verbose: false,
+            env: environment,
+            settings: settings,
+            fetcher: UsageFetcher(environment: environment),
+            claudeFetcher: ZaiTestClaudeFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0))
+    }
+
+    private static func response(request: URLRequest, body: String) throws -> (Data, URLResponse) {
+        let response = try #require(HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]))
+        return (Data(body.utf8), response)
+    }
+
+    private static func pluginSnapshot(
+        quotaFixture: String,
+        modelUsageFixture: String = Self.modelUsageFixture,
+        engine: ProviderPluginEngineKind = .automatic) async throws -> UsageSnapshot
+    {
+        let transport = ProviderHTTPTransportHandler { request in
+            let body = request.url?.path.hasSuffix("/quota/limit") == true
+                ? quotaFixture
+                : modelUsageFixture
+            return try Self.response(request: request, body: body)
+        }
+        return try await BundledPluginTestSupport.runtime("zai", engine: engine, transport: transport).fetchUsage(
+            settings: [
+                "Z_AI_REGION": "global",
+                "Z_AI_USAGE_SCOPE": "personal",
+            ],
+            secrets: ["Z_AI_API_KEY": "fixture-key"],
+            now: Date(timeIntervalSince1970: 1_785_816_000))
+    }
+
+    private static let quotaFixture = #"""
+    {"code":200,"msg":"success","success":true,"data":{"planName":"Pro","limits":[
+      {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":25,"nextResetTime":1785816000000},
+      {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":9,"nextResetTime":1786291200000},
+      {"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":224,"remaining":776,
+       "percentage":22,"usageDetails":[{"modelCode":"search-prime","usage":210}]}
+    ]}}
+    """#
+
+    private static let explicitTimeLimitFixture = #"""
+    {"code":200,"msg":"success","success":true,"data":{"limits":[
+      {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":25,"nextResetTime":1785816000000},
+      {"type":"TIME_LIMIT","unit":3,"number":5,"percentage":22,"nextResetTime":1785816000000}
+    ]}}
+    """#
+
+    private static let unknownTimeLimitFixture = #"""
+    {"code":200,"msg":"success","success":true,"data":{"limits":[
+      {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":25,"nextResetTime":1785816000000},
+      {"type":"TIME_LIMIT","unit":0,"number":1,"percentage":22,"nextResetTime":1785816000000}
+    ]}}
+    """#
+
+    private static let modelUsageFixture = #"""
+    {"code":200,"msg":"success","success":true,"data":{
+      "x_time":["2026-08-02 08:00","2026-08-02 09:00"],
+      "modelDataList":[{"modelName":"glm-4.6","tokensUsage":[100,null]},
+      {"modelName":"glm-4.5","tokensUsage":[50,25]}]}}
+    """#
+
+    private static let largeModelUsageFixture = #"""
+    {"code":200,"msg":"success","success":true,"data":{
+      "x_time":["2026-08-02 08:00","2026-08-02 09:00"],
+      "modelDataList":[{"modelName":"Example Large","tokensUsage":[5000000000,300000000]},
+      {"modelName":"Example Medium","tokensUsage":[400000000,91075408]},
+      {"modelName":"Example Small","tokensUsage":[70000000,6124317]},
+      {"modelName":"Example Exact","tokensUsage":[500000,499999]}]}}
+    """#
+
+    private static let emptyModelUsageFixture =
+        #"{"code":200,"msg":"success","success":true,"data":{"x_time":[],"modelDataList":[]}}"#
+}
+
+private actor RequestRecorder {
+    var requests: [URLRequest] = []
+    func append(_ request: URLRequest) {
+        self.requests.append(request)
     }
 }
 
-@Suite
-struct ZaiAPIRegionTests {
-    @Test
-    func defaultsToGlobalEndpoint() {
-        let url = ZaiUsageFetcher.resolveQuotaURL(region: .global, environment: [:])
-        #expect(url.absoluteString == "https://api.z.ai/api/monitor/usage/quota/limit")
+private struct ZaiTestClaudeFetcher: ClaudeUsageFetching {
+    func loadLatestUsage(model _: String) async throws -> ClaudeUsageSnapshot {
+        throw ProviderPluginError.script("unused")
     }
 
-    @Test
-    func usesBigModelRegionWhenSelected() {
-        let url = ZaiUsageFetcher.resolveQuotaURL(region: .bigmodelCN, environment: [:])
-        #expect(url.absoluteString == "https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+    func debugRawProbe(model _: String) async -> String {
+        "unused"
     }
 
-    @Test
-    func quotaUrlEnvironmentOverrideWins() {
-        let env = [ZaiSettingsReader.quotaURLKey: "https://open.bigmodel.cn/api/coding/paas/v4"]
-        let url = ZaiUsageFetcher.resolveQuotaURL(region: .global, environment: env)
-        #expect(url.absoluteString == "https://open.bigmodel.cn/api/coding/paas/v4")
-    }
-
-    @Test
-    func apiHostEnvironmentAppendsQuotaPath() {
-        let env = [ZaiSettingsReader.apiHostKey: "open.bigmodel.cn"]
-        let url = ZaiUsageFetcher.resolveQuotaURL(region: .global, environment: env)
-        #expect(url.absoluteString == "https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+    func detectVersion() -> String? {
+        nil
     }
 }

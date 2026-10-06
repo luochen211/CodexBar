@@ -27,6 +27,13 @@ public enum VertexAITokenRefresher {
     }
 
     public static func refresh(_ credentials: VertexAIOAuthCredentials) async throws -> VertexAIOAuthCredentials {
+        try await self.refresh(credentials, session: ProviderHTTPClient.shared)
+    }
+
+    static func refresh(
+        _ credentials: VertexAIOAuthCredentials,
+        session transport: any ProviderHTTPTransport) async throws -> VertexAIOAuthCredentials
+    {
         guard !credentials.refreshToken.isEmpty else {
             throw RefreshError.invalidResponse("No refresh token available")
         }
@@ -43,18 +50,13 @@ public enum VertexAITokenRefresher {
             "grant_type": "refresh_token",
         ]
 
-        let bodyString = bodyParams
-            .map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&")
-        request.httpBody = bodyString.data(using: .utf8)
+        request.httpBody = FormURLEncoding.body(bodyParams)
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw RefreshError.invalidResponse("No HTTP response")
-            }
+            let response = try await transport.response(for: request)
+            let data = response.data
 
-            if http.statusCode == 400 || http.statusCode == 401 {
+            if response.statusCode == 400 || response.statusCode == 401 {
                 if let errorCode = Self.extractErrorCode(from: data) {
                     switch errorCode.lowercased() {
                     case "invalid_grant":
@@ -68,21 +70,24 @@ public enum VertexAITokenRefresher {
                 throw RefreshError.expired
             }
 
-            guard http.statusCode == 200 else {
-                throw RefreshError.invalidResponse("Status \(http.statusCode)")
+            guard response.statusCode == 200 else {
+                throw RefreshError.invalidResponse("Status \(response.statusCode)")
             }
 
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw RefreshError.invalidResponse("Invalid JSON")
             }
 
-            let newAccessToken = json["access_token"] as? String ?? credentials.accessToken
+            guard let newAccessToken = json["access_token"] as? String,
+                  !newAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                throw RefreshError.invalidResponse("Missing access token")
+            }
             let expiresIn = json["expires_in"] as? Double ?? 3600
             let newExpiryDate = Date().addingTimeInterval(expiresIn)
 
-            // Extract email from new ID token if present
             let idToken = json["id_token"] as? String
-            let email = Self.extractEmailFromIdToken(idToken) ?? credentials.email
+            let email = VertexAIIDToken.email(from: idToken) ?? credentials.email
 
             return VertexAIOAuthCredentials(
                 accessToken: newAccessToken,
@@ -102,29 +107,5 @@ public enum VertexAITokenRefresher {
     private static func extractErrorCode(from data: Data) -> String? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return json["error"] as? String
-    }
-
-    private static func extractEmailFromIdToken(_ token: String?) -> String? {
-        guard let token, !token.isEmpty else { return nil }
-
-        let parts = token.components(separatedBy: ".")
-        guard parts.count >= 2 else { return nil }
-
-        var payload = parts[1]
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-
-        let remainder = payload.count % 4
-        if remainder > 0 {
-            payload += String(repeating: "=", count: 4 - remainder)
-        }
-
-        guard let data = Data(base64Encoded: payload, options: .ignoreUnknownCharacters),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return nil
-        }
-
-        return json["email"] as? String
     }
 }

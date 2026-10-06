@@ -34,7 +34,7 @@ final class InlineIconToggleButton: NSButton {
             self.paddingConstraints.first { $0.firstAttribute == .top }?.constant = self.contentPadding.top
             self.paddingConstraints.first { $0.firstAttribute == .leading }?.constant = self.contentPadding.left
             self.paddingConstraints.first { $0.firstAttribute == .trailing }?.constant = -self.contentPadding.right
-            self.paddingConstraints.first { $0.firstAttribute == .bottom }?.constant = -(self.contentPadding.bottom + 4)
+            self.paddingConstraints.first { $0.firstAttribute == .bottom }?.constant = -self.contentPadding.bottom
             if !self.isConfiguring { self.invalidateIntrinsicContentSize() }
         }
     }
@@ -47,6 +47,7 @@ final class InlineIconToggleButton: NSButton {
             super.attributedTitle = NSAttributedString(string: "")
             super.attributedAlternateTitle = NSAttributedString(string: "")
             self.titleField.stringValue = newValue
+            self.setAccessibilityLabel(newValue)
             if !self.isConfiguring { self.invalidateIntrinsicContentSize() }
         }
     }
@@ -68,14 +69,6 @@ final class InlineIconToggleButton: NSButton {
 
     func setTitleFontSize(_ size: CGFloat) {
         self.titleField.font = NSFont.systemFont(ofSize: size)
-    }
-
-    func setAllowsTwoLineTitle(_ allow: Bool) {
-        let hasWhitespace = self.titleField.stringValue.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
-        let shouldWrap = allow && hasWhitespace
-        self.titleField.maximumNumberOfLines = shouldWrap ? 2 : 1
-        self.titleField.usesSingleLineMode = !shouldWrap
-        self.titleField.lineBreakMode = shouldWrap ? .byWordWrapping : .byTruncatingTail
     }
 
     override var intrinsicContentSize: NSSize {
@@ -108,6 +101,7 @@ final class InlineIconToggleButton: NSButton {
         self.setButtonType(.toggle)
         self.controlSize = .small
         self.wantsLayer = true
+        self.setAccessibilityRole(.button)
 
         self.iconView.imageScaling = .scaleNone
         self.iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -131,7 +125,7 @@ final class InlineIconToggleButton: NSButton {
         self.iconSizeConstraints = [iconWidth, iconHeight]
 
         let top = self.stack.topAnchor.constraint(
-            equalTo: self.topAnchor,
+            greaterThanOrEqualTo: self.topAnchor,
             constant: self.contentPadding.top)
         let leading = self.stack.leadingAnchor.constraint(
             greaterThanOrEqualTo: self.leadingAnchor,
@@ -141,10 +135,11 @@ final class InlineIconToggleButton: NSButton {
             constant: -self.contentPadding.right)
         let centerX = self.stack.centerXAnchor.constraint(equalTo: self.centerXAnchor)
         centerX.priority = .defaultHigh
+        let centerY = self.stack.centerYAnchor.constraint(equalTo: self.centerYAnchor)
         let bottom = self.stack.bottomAnchor.constraint(
             lessThanOrEqualTo: self.bottomAnchor,
-            constant: -(self.contentPadding.bottom + 4))
-        self.paddingConstraints = [top, leading, trailing, bottom, centerX]
+            constant: -self.contentPadding.bottom)
+        self.paddingConstraints = [top, leading, trailing, bottom, centerX, centerY]
 
         NSLayoutConstraint.activate(self.paddingConstraints + self.iconSizeConstraints)
     }
@@ -176,6 +171,7 @@ final class StackedToggleButton: NSButton {
             super.attributedTitle = NSAttributedString(string: "")
             super.attributedAlternateTitle = NSAttributedString(string: "")
             self.titleField.stringValue = newValue
+            self.setAccessibilityLabel(newValue)
             if !self.isConfiguring { self.invalidateIntrinsicContentSize() }
         }
     }
@@ -197,14 +193,6 @@ final class StackedToggleButton: NSButton {
 
     func setTitleFontSize(_ size: CGFloat) {
         self.titleField.font = NSFont.systemFont(ofSize: size)
-    }
-
-    func setAllowsTwoLineTitle(_ allow: Bool) {
-        let hasWhitespace = self.titleField.stringValue.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
-        let shouldWrap = allow && hasWhitespace
-        self.titleField.maximumNumberOfLines = shouldWrap ? 2 : 1
-        self.titleField.usesSingleLineMode = !shouldWrap
-        self.titleField.lineBreakMode = shouldWrap ? .byWordWrapping : .byTruncatingTail
     }
 
     override var intrinsicContentSize: NSSize {
@@ -237,6 +225,7 @@ final class StackedToggleButton: NSButton {
         self.setButtonType(.toggle)
         self.controlSize = .small
         self.wantsLayer = true
+        self.setAccessibilityRole(.button)
 
         self.iconView.imageScaling = .scaleNone
         self.iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -259,11 +248,9 @@ final class StackedToggleButton: NSButton {
         let iconHeight = self.iconView.heightAnchor.constraint(equalToConstant: 16)
         self.iconSizeConstraints = [iconWidth, iconHeight]
 
-        // Avoid subpixel centering: pin from the top so the icon sits on whole-point coordinates.
         // Force an even layout width (button width minus padding) so the icon doesn't land on 0.5pt centers.
-        // Reserve some bottom space for the "weekly remaining" indicator line.
         let top = self.stack.topAnchor.constraint(
-            equalTo: self.topAnchor,
+            greaterThanOrEqualTo: self.topAnchor,
             constant: self.contentPadding.top)
         let leading = self.stack.leadingAnchor.constraint(
             equalTo: self.leadingAnchor,
@@ -273,8 +260,9 @@ final class StackedToggleButton: NSButton {
             constant: -self.contentPadding.right)
         let bottom = self.stack.bottomAnchor.constraint(
             lessThanOrEqualTo: self.bottomAnchor,
-            constant: -(self.contentPadding.bottom + 4))
-        self.paddingConstraints = [top, leading, trailing, bottom]
+            constant: -self.contentPadding.bottom)
+        let centerY = self.stack.centerYAnchor.constraint(equalTo: self.centerYAnchor)
+        self.paddingConstraints = [top, leading, trailing, bottom, centerY]
 
         NSLayoutConstraint.activate(self.paddingConstraints + self.iconSizeConstraints)
     }

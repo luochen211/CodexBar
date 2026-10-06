@@ -1,10 +1,6 @@
-import AppKit
 import CodexBarCore
-import CodexBarMacroSupport
 import Foundation
-import SwiftUI
 
-@ProviderImplementationRegistration
 struct OpenCodeProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .opencode
 
@@ -28,7 +24,9 @@ struct OpenCodeProviderImplementation: ProviderImplementation {
     @MainActor
     func tokenAccountsVisibility(context: ProviderSettingsContext, support: TokenAccountSupport) -> Bool {
         guard support.requiresManualCookieSource else { return true }
-        if !context.settings.tokenAccounts(for: context.provider).isEmpty { return true }
+        if !context.settings.tokenAccounts(for: context.provider).isEmpty {
+            return true
+        }
         return context.settings.opencodeCookieSource == .manual
     }
 
@@ -41,39 +39,30 @@ struct OpenCodeProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
-        let cookieBinding = Binding(
-            get: { context.settings.opencodeCookieSource.rawValue },
-            set: { raw in
-                context.settings.opencodeCookieSource = ProviderCookieSource(rawValue: raw) ?? .auto
-            })
-        let cookieOptions = ProviderCookieSourceUI.options(
-            allowsOff: false,
-            keychainDisabled: context.settings.debugDisableKeychainAccess)
-
-        let cookieSubtitle: () -> String? = {
-            ProviderCookieSourceUI.subtitle(
-                source: context.settings.opencodeCookieSource,
-                keychainDisabled: context.settings.debugDisableKeychainAccess,
-                auto: "Automatic imports browser cookies from opencode.ai.",
-                manual: "Paste a Cookie header captured from the billing page.",
-                off: "OpenCode cookies are disabled.")
-        }
-
-        return [
-            ProviderSettingsPickerDescriptor(
+        [
+            ProviderCookieSourceUI.picker(
                 id: "opencode-cookie-source",
-                title: "Cookie source",
-                subtitle: "Automatic imports browser cookies from opencode.ai.",
-                dynamicSubtitle: cookieSubtitle,
-                binding: cookieBinding,
-                options: cookieOptions,
-                isVisible: nil,
-                onChange: nil,
+                context: context,
+                source: \.opencodeCookieSource,
+                allowsOff: false,
+                subtitles: {
+                    .init(
+                        auto: L("Automatic imports browser cookies from opencode.ai."),
+                        manual: L("Paste a Cookie header captured from %@.", "the billing page"),
+                        off: L("%@ cookies are disabled.", "OpenCode"))
+                },
                 trailingText: {
-                    guard let entry = CookieHeaderCache.load(provider: .opencode) else { return nil }
-                    let when = entry.storedAt.relativeDescription()
-                    return "Cached: \(entry.sourceLabel) • \(when)"
-                }),
+                    ProviderCookieRefreshAction.trailingText(
+                        provider: .opencode,
+                        cookieSource: context.settings.opencodeCookieSource,
+                        context: context)
+                },
+                trailingActions: [
+                    ProviderCookieRefreshAction.descriptor(
+                        provider: .opencode,
+                        cookieSource: { context.settings.opencodeCookieSource },
+                        context: context),
+                ]),
         ]
     }
 
@@ -86,10 +75,9 @@ struct OpenCodeProviderImplementation: ProviderImplementation {
                 subtitle: "Optional override if workspace lookup fails.",
                 kind: .plain,
                 placeholder: "wrk_…",
-                binding: context.stringBinding(\.opencodeWorkspaceID),
+                binding: context.binding(\.opencodeWorkspaceID),
                 actions: [],
-                isVisible: nil,
-                onActivate: nil),
+                isVisible: nil),
         ]
     }
 }

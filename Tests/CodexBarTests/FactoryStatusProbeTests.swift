@@ -2,10 +2,21 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
-@Suite
+struct FactoryProviderDescriptorTests {
+    @Test
+    func `descriptor keeps legacy labels by default`() {
+        let metadata = FactoryProviderDescriptor.descriptor.metadata
+
+        #expect(metadata.sessionLabel == "Standard")
+        #expect(metadata.weeklyLabel == "Premium")
+        #expect(metadata.opusLabel == nil)
+        #expect(!metadata.supportsOpus)
+    }
+}
+
 struct FactoryStatusSnapshotTests {
     @Test
-    func mapsUsageSnapshotWindowsAndLoginMethod() {
+    func `maps usage snapshot windows and login method`() {
         let periodEnd = Date(timeIntervalSince1970: 1_738_368_000) // Feb 1, 2025
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 50,
@@ -33,7 +44,7 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func treatsLargeAllowancesAsUnlimited() {
+    func `treats large allowances as unlimited`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 50_000_000,
             standardOrgTokens: 0,
@@ -56,7 +67,7 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func prefersAPIUsedRatioWhenAllowanceMissing() {
+    func `prefers API used ratio when allowance missing`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 72_311_737,
             standardOrgTokens: 72_311_737,
@@ -82,7 +93,7 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func usesPercentScaleRatioWhenAllowanceMissing() {
+    func `uses percent scale ratio when allowance missing`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 0,
             standardOrgTokens: 0,
@@ -107,7 +118,34 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func fallsBackToCalculationWhenAPIRatioMissing() {
+    func `falls back to calculation when API ratio is zero but usage and allowance are present`() {
+        let snapshot = FactoryStatusSnapshot(
+            standardUserTokens: 5_826_293,
+            standardOrgTokens: 0,
+            standardAllowance: 20_000_000,
+            standardUsedRatio: 0,
+            premiumUserTokens: 0,
+            premiumOrgTokens: 0,
+            premiumAllowance: 0,
+            premiumUsedRatio: 0,
+            periodStart: nil,
+            periodEnd: nil,
+            planName: nil,
+            tier: nil,
+            organizationName: nil,
+            accountEmail: nil,
+            userId: nil,
+            rawJSON: nil)
+
+        let usage = snapshot.toUsageSnapshot()
+
+        #expect(usage.primary?.usedPercent ?? 0 > 29)
+        #expect(usage.primary?.usedPercent ?? 0 < 30)
+        #expect(usage.secondary?.usedPercent == 0)
+    }
+
+    @Test
+    func `falls back to calculation when API ratio missing`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 50_000_000,
             standardOrgTokens: 0,
@@ -132,7 +170,7 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func fallsBackWhenAPIRatioIsInvalid() {
+    func `falls back when API ratio is invalid`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 50_000_000,
             standardOrgTokens: 0,
@@ -157,7 +195,7 @@ struct FactoryStatusSnapshotTests {
     }
 
     @Test
-    func clampsSlightlyOutOfRangeRatios() {
+    func `clamps slightly out of range ratios`() {
         let snapshot = FactoryStatusSnapshot(
             standardUserTokens: 100_000_000,
             standardOrgTokens: 0,
@@ -182,10 +220,9 @@ struct FactoryStatusSnapshotTests {
     }
 }
 
-@Suite
 struct FactoryStatusProbeWorkOSTests {
     @Test
-    func detectsMissingRefreshTokenPayload() {
+    func `detects missing refresh token payload`() {
         let payload = Data("""
         {"error":"invalid_request","error_description":"Missing refresh token."}
         """.utf8)

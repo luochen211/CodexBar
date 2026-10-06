@@ -79,12 +79,20 @@ When the CLI is unavailable or not authenticated, CodexBar falls back to browser
 
 The provider includes an automatic session keepalive system:
 
-- **Check Interval**: Every 5 minutes
+- **Check Interval**: Every 1 minute
 - **Refresh Buffer**: Refreshes 5 minutes before cookie expiration
-- **Rate Limiting**: Minimum 2 minutes between refresh attempts
+- **Rate Limiting**: Minimum 1 minute between refresh attempts
 - **Session Cookies**: Refreshed every 30 minutes (no expiration date)
 
 This ensures your session stays active without manual intervention.
+
+Disabling Augment stops its timer and cancels in-flight automatic and forced refreshes. Retired work cannot start
+follow-up cookie imports, cache writes, recovery actions, or notifications after it resumes. Re-enabling starts a new
+keepalive lifecycle, and cancelling one manual refresh does not cancel another active refresh.
+
+Login-required events use the shared, off-by-default **Settings → Notifications → Credential expiry**
+option. Repeated keepalive and usage failures share one episode, and network retry exhaustion does not
+send an expiry alert. See [credential notifications](credential-notifications.md).
 
 ### API Endpoints
 
@@ -154,6 +162,7 @@ This displays:
 - Cookies are filtered by domain before sending to API endpoints
 - No cookies are sent to third-party services
 - Session keepalive only runs when Augment is enabled
+- Keepalive diagnostics omit outgoing cookies, Set-Cookie values, and raw response bodies.
 
 ## Technical Details
 
@@ -170,7 +179,7 @@ This prevents cookies from other subdomains being sent to the API.
 
 ### Session Refresh Mechanism
 
-1. Keepalive checks cookie expiration every 5 minutes
+1. Keepalive checks cookie expiration every 1 minute
 2. If expiration is within 5 minutes, triggers refresh
 3. Pings `/api/auth/session` to trigger cookie update
 4. Waits 1 second for browser to update cookies

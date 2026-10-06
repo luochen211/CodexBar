@@ -15,56 +15,29 @@ When developing CodexBar, you may see frequent keychain permission prompts like:
 > **CodexBar wants to access key "Claude Code-credentials" in your keychain.**
 
 This happens because each rebuild creates a new code signature, and macOS treats it as a "different" app.
+That can affect both CodexBar-owned entries (`com.steipete.CodexBar`, `com.steipete.codexbar.cache`) and
+third-party items such as `Claude Code-credentials`, so an ad-hoc-signed rebuild can keep re-triggering
+password/keychain approval dialogs even after you previously chose **Always Allow**.
 
 ### Quick Fix (Temporary)
 
 When the prompt appears, click **"Always Allow"** instead of just "Allow". This grants access to the current build.
 
-### Permanent Fix (Recommended)
+### Stable Signing
 
-Use a stable development certificate that doesn't change between rebuilds:
+Use an installed **Developer ID Application** signing identity with a Team ID. Create or install it through Xcode → Settings → Accounts →
+Manage Certificates, then configure its full name or SHA-1 certificate hash as `APP_IDENTITY`.
+For the accepted identity formats and failure cases, see [local identity signing](DEVELOPMENT.md#local-development-build).
 
-#### 1. Create Development Certificate
+`compile_and_run.sh` automatically selects a Developer ID Application identity with a Team ID. Without one, it uses ad-hoc signing. An explicit `APP_IDENTITY` is validated by packaging and fails
+if missing, ambiguous, or unable to supply a Team ID; it never silently falls back to another signing mode.
 
-```bash
-./Scripts/setup_dev_signing.sh
-```
-
-This creates a self-signed certificate named "CodexBar Development".
-
-#### 2. Trust the Certificate
-
-1. Open **Keychain Access.app**
-2. Find **"CodexBar Development"** in the **login** keychain
-3. Double-click it
-4. Expand the **"Trust"** section
-5. Set **"Code Signing"** to **"Always Trust"**
-6. Close the window (enter your password when prompted)
-
-#### 3. Configure Your Shell
-
-Add this to your `~/.zshrc` (or `~/.bashrc` if using bash):
-
-```bash
-export APP_IDENTITY='CodexBar Development'
-```
-
-Then restart your terminal:
-
-```bash
-source ~/.zshrc
-```
-
-#### 4. Rebuild
-
-```bash
-./Scripts/compile_and_run.sh
-```
-
-Now your builds will use the stable certificate, and keychain prompts will be much less frequent!
-
-> Note: `compile_and_run.sh` now auto-detects a valid signing identity (Developer ID or CodexBar Development).
-> Set `APP_IDENTITY` to override the auto-detected choice.
+The former `setup_dev_signing.sh` self-signed certificate workflow has been removed because those certificates
+have no Apple Team ID for app/widget entitlements. If your shell still sets `APP_IDENTITY='CodexBar Development'`,
+replace it with a Developer ID Application identity or unset it to use automatic selection. Apple Development
+certificate names can carry personal IDs rather than Team IDs and are no longer auto-selected either. Existing certificates and
+Keychain entries are left in place. Consistent signing can reduce prompts, but does not grant access to
+third-party credentials automatically.
 
 ---
 
@@ -96,10 +69,22 @@ The build script creates `CodexBar.app` in the project root. Old numbered builds
 This script:
 1. Kills existing CodexBar instances
 2. Runs `swift build` (release mode)
-3. Runs `swift test` (all tests)
+3. Runs the sharded full test suite when `--test` is passed
 4. Packages the app with `./Scripts/package_app.sh`
 5. Launches `CodexBar.app`
 6. Verifies it stays running
+
+Launching an unbundled `CodexBar` executable, including SwiftPM builds using `.build` or a custom scratch path, disables
+Keychain access for that process to avoid repeated password prompts. Use the packaged `CodexBar.app` when local
+validation needs browser cookies or stored credentials; packaged app bundles keep their normal Keychain behavior
+regardless of signing mode.
+
+When the script falls back to ad-hoc signing, it preserves CodexBar-owned keychain state by default.
+That means you may still see keychain prompts for existing CodexBar cache entries, but allowing those prompts keeps the
+cached browser/OAuth state available across normal rebuilds.
+If you want a clean reset of CodexBar-owned keychain state for an ad-hoc build, run
+`./Scripts/compile_and_run.sh --clear-adhoc-keychain` before relaunching.
+Third-party keychain items still need stable signing if you want macOS to remember **Always Allow** across rebuilds.
 
 ### Quick Build (No Tests)
 
@@ -111,7 +96,7 @@ swift build -c release
 ### Run Tests Only
 
 ```bash
-swift test
+make test
 ```
 
 ### Debug Build

@@ -1,7 +1,9 @@
 #if canImport(Darwin)
 import Darwin
-#else
+#elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 import Foundation
 
@@ -12,12 +14,14 @@ actor CodexCLISession {
         case launchFailed(String)
         case timedOut
         case processExited
+        case outputTooLarge
 
         var errorDescription: String? {
             switch self {
             case let .launchFailed(msg): "Failed to launch Codex CLI session: \(msg)"
             case .timedOut: "Codex CLI session timed out."
             case .processExited: "Codex CLI session exited."
+            case .outputTooLarge: "Codex CLI session produced more output than CodexBar can safely process."
             }
         }
     }
@@ -31,58 +35,25 @@ actor CodexCLISession {
     private var startedAt: Date?
     private var ptyRows: UInt16 = 0
     private var ptyCols: UInt16 = 0
+    @ProcessEnvironment private var sessionEnvironment: [String: String]?
+    private var sessionArguments: [String] = []
+    private var sessionWorkingDirectory: URL?
 
-    private struct RollingBuffer {
-        private let maxNeedle: Int
-        private var tail = Data()
-
-        init(maxNeedle: Int) {
-            self.maxNeedle = max(0, maxNeedle)
-        }
-
-        mutating func append(_ data: Data) -> Data {
-            guard !data.isEmpty else { return Data() }
-            var combined = Data()
-            combined.reserveCapacity(self.tail.count + data.count)
-            combined.append(self.tail)
-            combined.append(data)
-            if self.maxNeedle > 1 {
-                if combined.count >= self.maxNeedle - 1 {
-                    self.tail = combined.suffix(self.maxNeedle - 1)
-                } else {
-                    self.tail = combined
-                }
-            } else {
-                self.tail.removeAll(keepingCapacity: true)
-            }
-            return combined
-        }
-
-        mutating func reset() {
-            self.tail.removeAll(keepingCapacity: true)
-        }
-    }
-
-    static func lowercasedASCII(_ data: Data) -> Data {
-        guard !data.isEmpty else { return data }
-        var out = Data(count: data.count)
-        out.withUnsafeMutableBytes { dest in
-            data.withUnsafeBytes { source in
-                let src = source.bindMemory(to: UInt8.self)
-                let dst = dest.bindMemory(to: UInt8.self)
-                for idx in 0..<src.count {
-                    var byte = src[idx]
-                    if byte >= 65, byte <= 90 { byte += 32 }
-                    dst[idx] = byte
-                }
-            }
-        }
-        return out
+    struct CaptureOptions {
+        let timeout: TimeInterval
+        let rows: UInt16
+        let cols: UInt16
+        @ProcessEnvironment private(set) var environment: [String: String]
+        let extraArgs: [String]
+        let workingDirectory: URL?
     }
 
     // swiftlint:disable cyclomatic_complexity
-    func captureStatus(binary: String, timeout: TimeInterval, rows: UInt16, cols: UInt16) async throws -> String {
-        try self.ensureStarted(binary: binary, rows: rows, cols: cols)
+    func captureStatus(
+        binary: String,
+        options: CaptureOptions) async throws -> String
+    {
+        try self.ensureStarted(binary: binary, options: options)
         if let startedAt {
             let sinceStart = Date().timeIntervalSince(startedAt)
             if sinceStart < 0.4 {
@@ -94,23 +65,17 @@ actor CodexCLISession {
 
         let script = "/status"
         let cursorQuery = Data([0x1B, 0x5B, 0x36, 0x6E])
-        let statusMarkers = [
-            "Credits:",
-            "5h limit",
-            "5-hour limit",
-            "Weekly limit",
-        ].map { Data($0.utf8) }
-        let updateNeedles = ["Update available!", "Run bun install -g @openai/codex", "0.60.1 ->"]
-        let updateNeedlesLower = updateNeedles.map { Data($0.lowercased().utf8) }
-        let statusNeedleLengths = statusMarkers.map(\.count)
-        let updateNeedleLengths = updateNeedlesLower.map(\.count)
-        let statusMaxNeedle = ([cursorQuery.count] + statusNeedleLengths).max() ?? cursorQuery.count
-        let updateMaxNeedle = updateNeedleLengths.max() ?? 0
-        var statusScanBuffer = RollingBuffer(maxNeedle: statusMaxNeedle)
-        var updateScanBuffer = RollingBuffer(maxNeedle: updateMaxNeedle)
+        var statusScanBuffer = StreamScanBuffer(maxNeedle: max(cursorQuery.count, CodexStatusMarkers.longestStatus))
+        var updateScanBuffer = StreamScanBuffer(maxNeedle: CodexStatusMarkers.longestUpdatePrompt)
 
-        var buffer = Data()
-        let deadline = Date().addingTimeInterval(timeout)
+        var buffer = BoundedOutputBuffer()
+        func appendOutput(_ data: Data) throws {
+            guard buffer.append(data) else {
+                self.cleanup()
+                throw SessionError.outputTooLarge
+            }
+        }
+        let deadline = Date().addingTimeInterval(options.timeout)
         var nextCursorCheckAt = Date(timeIntervalSince1970: 0)
 
         var skippedCodexUpdate = false
@@ -126,7 +91,7 @@ actor CodexCLISession {
         while Date() < deadline {
             let newData = self.readChunk()
             if !newData.isEmpty {
-                buffer.append(newData)
+                try appendOutput(newData)
             }
             let scanData = statusScanBuffer.append(newData)
             if Date() >= nextCursorCheckAt,
@@ -137,15 +102,15 @@ actor CodexCLISession {
                 nextCursorCheckAt = Date().addingTimeInterval(1.0)
             }
             if !scanData.isEmpty, !sawCodexStatus {
-                if statusMarkers.contains(where: { scanData.range(of: $0) != nil }) {
+                if CodexStatusMarkers.status.contains(where: { scanData.range(of: $0) != nil }) {
                     sawCodexStatus = true
                 }
             }
 
             if !skippedCodexUpdate, !sawCodexUpdatePrompt, !newData.isEmpty {
-                let lowerData = Self.lowercasedASCII(newData)
+                let lowerData = StreamScanBuffer.lowercasedASCII(newData)
                 let lowerScan = updateScanBuffer.append(lowerData)
-                if updateNeedlesLower.contains(where: { lowerScan.range(of: $0) != nil }) {
+                if CodexStatusMarkers.updatePrompt.contains(where: { lowerScan.range(of: $0) != nil }) {
                     sawCodexUpdatePrompt = true
                 }
             }
@@ -217,7 +182,7 @@ actor CodexCLISession {
             while Date() < settleDeadline {
                 let newData = self.readChunk()
                 if !newData.isEmpty {
-                    buffer.append(newData)
+                    try appendOutput(newData)
                 }
                 let scanData = statusScanBuffer.append(newData)
                 if Date() >= nextCursorCheckAt,
@@ -231,7 +196,7 @@ actor CodexCLISession {
             }
         }
 
-        guard !buffer.isEmpty, let text = String(data: buffer, encoding: .utf8) else {
+        guard !buffer.data.isEmpty, let text = String(data: buffer.data, encoding: .utf8) else {
             throw SessionError.timedOut
         }
         return text
@@ -243,12 +208,18 @@ actor CodexCLISession {
         self.cleanup()
     }
 
-    private func ensureStarted(binary: String, rows: UInt16, cols: UInt16) throws {
+    private func ensureStarted(
+        binary: String,
+        options: CaptureOptions) throws
+    {
         if let proc = self.process,
            proc.isRunning,
            self.binaryPath == binary,
-           self.ptyRows == rows,
-           self.ptyCols == cols
+           self.ptyRows == options.rows,
+           self.ptyCols == options.cols,
+           self.sessionEnvironment == options.environment,
+           self.sessionArguments == options.extraArgs,
+           self.sessionWorkingDirectory == options.workingDirectory
         {
             return
         }
@@ -256,7 +227,7 @@ actor CodexCLISession {
 
         var primaryFD: Int32 = -1
         var secondaryFD: Int32 = -1
-        var win = winsize(ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0)
+        var win = winsize(ws_row: options.rows, ws_col: options.cols, ws_xpixel: 0, ws_ypixel: 0)
         guard openpty(&primaryFD, &secondaryFD, nil, nil, &win) == 0 else {
             throw SessionError.launchFailed("openpty failed")
         }
@@ -268,13 +239,23 @@ actor CodexCLISession {
         let proc = Process()
         let resolvedURL = URL(fileURLWithPath: binary)
         proc.executableURL = resolvedURL
-        proc.arguments = ["-s", "read-only", "-a", "untrusted"]
+        proc.arguments = options.extraArgs
         proc.standardInput = secondaryHandle
         proc.standardOutput = secondaryHandle
         proc.standardError = secondaryHandle
+        proc.currentDirectoryURL = options.workingDirectory
 
-        let env = TTYCommandRunner.enrichedEnvironment()
+        let env = TTYCommandRunner.enrichedEnvironment(
+            baseEnv: options.environment,
+            home: options.environment["HOME"] ?? NSHomeDirectory())
         proc.environment = env
+
+        guard TTYCommandRunner.beginActiveProcessLaunchForAppShutdown() else {
+            try? primaryHandle.close()
+            try? secondaryHandle.close()
+            throw SessionError.launchFailed("App shutdown in progress")
+        }
+        defer { TTYCommandRunner.endActiveProcessLaunchForAppShutdown() }
 
         do {
             try proc.run()
@@ -285,9 +266,21 @@ actor CodexCLISession {
         }
 
         let pid = proc.processIdentifier
+        guard TTYCommandRunner.registerActiveProcessForAppShutdown(
+            pid: pid,
+            binary: resolvedURL.lastPathComponent)
+        else {
+            proc.terminate()
+            kill(pid, SIGKILL)
+            try? primaryHandle.close()
+            try? secondaryHandle.close()
+            throw SessionError.launchFailed("App shutdown in progress")
+        }
+
         var processGroup: pid_t?
         if setpgid(pid, pid) == 0 {
             processGroup = pid
+            TTYCommandRunner.updateActiveProcessGroupForAppShutdown(pid: pid, processGroup: processGroup)
         }
 
         self.process = proc
@@ -297,8 +290,11 @@ actor CodexCLISession {
         self.processGroup = processGroup
         self.binaryPath = binary
         self.startedAt = Date()
-        self.ptyRows = rows
-        self.ptyCols = cols
+        self.ptyRows = options.rows
+        self.ptyCols = options.cols
+        self.sessionEnvironment = options.environment
+        self.sessionArguments = options.extraArgs
+        self.sessionWorkingDirectory = options.workingDirectory
     }
 
     private func cleanup() {
@@ -308,11 +304,16 @@ actor CodexCLISession {
         try? self.primaryHandle?.close()
         try? self.secondaryHandle?.close()
 
+        let descendants = self.process.map { TTYProcessTreeTerminator.descendantPIDs(of: $0.processIdentifier) } ?? []
         if let proc = self.process, proc.isRunning {
             proc.terminate()
         }
-        if let pgid = self.processGroup {
-            kill(-pgid, SIGTERM)
+        if let proc = self.process {
+            TTYProcessTreeTerminator.terminateProcessTree(
+                rootPID: proc.processIdentifier,
+                processGroup: self.processGroup,
+                signal: SIGTERM,
+                knownDescendants: descendants)
         }
         let waitDeadline = Date().addingTimeInterval(1.0)
         if let proc = self.process {
@@ -320,11 +321,17 @@ actor CodexCLISession {
                 usleep(100_000)
             }
             if proc.isRunning {
-                if let pgid = self.processGroup {
-                    kill(-pgid, SIGKILL)
+                TTYProcessTreeTerminator.terminateProcessTree(
+                    rootPID: proc.processIdentifier,
+                    processGroup: self.processGroup,
+                    signal: SIGKILL,
+                    knownDescendants: descendants)
+            } else {
+                for pid in descendants where pid > 0 {
+                    kill(pid, SIGKILL)
                 }
-                kill(proc.processIdentifier, SIGKILL)
             }
+            TTYCommandRunner.unregisterActiveProcessForAppShutdown(pid: proc.processIdentifier)
         }
 
         self.process = nil
@@ -336,6 +343,9 @@ actor CodexCLISession {
         self.startedAt = nil
         self.ptyRows = 0
         self.ptyCols = 0
+        self.sessionEnvironment = nil
+        self.sessionArguments = []
+        self.sessionWorkingDirectory = nil
     }
 
     private func readChunk() -> Data {

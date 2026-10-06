@@ -1,5 +1,5 @@
 ---
-summary: "MiniMax provider data sources: API token or browser cookies + coding plan remains API."
+summary: "MiniMax provider data sources: Coding Plan tokens, browser cookies, and web-session parsing."
 read_when:
   - Debugging MiniMax usage parsing
   - Updating MiniMax cookie handling or coding plan scraping
@@ -8,53 +8,46 @@ read_when:
 
 # MiniMax provider
 
-MiniMax supports API tokens or web sessions. Usage is fetched from the Coding Plan remains API using
-either a Bearer API token or a session cookie header.
+MiniMax supports Coding Plan API tokens or web sessions. Web-session mode uses MiniMax browser/session state and
+falls back across the provider's supported web requests when needed.
 
-## Data sources + fallback order
+## Data sources
 
-1) **API token** (preferred)
-   - Set in Preferences → Providers → MiniMax (stored in `~/.codexbar/config.json`) or `MINIMAX_API_KEY`.
-   - When present, MiniMax uses the API token and ignores cookies entirely.
+1) **Coding Plan API token**
+   - Set in Preferences → Providers → MiniMax (stored in `~/.codexbar/config.json`), `MINIMAX_CODING_API_KEY`,
+     or `MINIMAX_API_KEY`.
+   - When both environment variables are present, `MINIMAX_CODING_API_KEY` wins so a standard `sk-api-*` key does
+     not mask a coding-plan `sk-cp-*` key.
+   - Auto mode can fall back to the web/cookie path when API-token credentials are rejected or the global endpoint
+     returns 404.
 
-2) **Cached cookie header** (automatic, only when no API token)
-   - Keychain cache: `com.steipete.codexbar.cache` (account `cookie.minimax`).
+2) **Cached/imported browser session** (automatic web path)
+   - Uses CodexBar's standard cookie cache and browser import flow.
 
 3) **Browser cookie import** (automatic)
-   - Cookie order from provider metadata (default: Safari → Chrome → Firefox).
-   - Merges Chromium profile cookies across the primary + Network stores before attempting a request.
-   - Tries each browser source until the Coding Plan API accepts the cookies.
-   - Domain filters: `platform.minimax.io`, `minimax.io`.
+   - Uses provider metadata for browser order and MiniMax domain filters.
+   - Chromium browser storage can supplement imported cookies with access-token context when available. Discovery
+     follows the shared Chromium catalog, including Comet and Yandex, and only visits browsers with profile data.
+     It tries localStorage first, then sessionStorage, then MiniMax-origin IndexedDB when earlier stores yield no
+     tokens. These raw-storage reads do not decrypt cookies or request Keychain access.
 
-4) **Browser local storage access token** (Chromium-based)
-   - Reads `access_token` (and related tokens) from Chromium local storage (LevelDB) to authorize the remains API.
-   - If decoding fails, falls back to a text-entry scan for `minimax.io` keys/values and filters for MiniMax JWT claims.
-   - Used automatically; no UI field.
-   - Also extracts `GroupId` when present (appends query param).
-
-5) **Manual session cookie header** (optional override)
+4) **Manual session cookie header** (optional web-path override)
    - Stored in `~/.codexbar/config.json` via Preferences → Providers → MiniMax (Cookie source → Manual).
    - Accepts a raw `Cookie:` header or a full "Copy as cURL" string.
-   - When a cURL string is pasted, MiniMax extracts the cookie header plus `Authorization: Bearer …` and
-     `GroupId=…` for the remains API.
-   - CLI/runtime env: `MINIMAX_COOKIE` or `MINIMAX_COOKIE_HEADER`.
+   - Low-level no-settings runtime can read `MINIMAX_COOKIE` or `MINIMAX_COOKIE_HEADER`.
 
-## Endpoints
-- API token endpoint: `https://api.minimax.io/v1/coding_plan/remains`
-  - Requires `Authorization: Bearer <api_token>`.
-- Global host (cookies): `https://platform.minimax.io`
-- China mainland host: `https://platform.minimaxi.com`
-- `GET {host}/user-center/payment/coding-plan`
-  - HTML parse for "Available usage" and plan name.
-- `GET {host}/v1/api/openplatform/coding_plan/remains`
-  - Fallback when HTML parsing fails.
-  - Sent with a `Referer` to the Coding Plan page.
-  - Adds `Authorization: Bearer <access_token>` when available.
-  - Adds `GroupId` query param when known.
+## Requests
+- Web sessions use the global host or China mainland host.
 - Region picker in Providers settings toggles the host; environment overrides:
   - `MINIMAX_HOST=platform.minimaxi.com`
   - `MINIMAX_CODING_PLAN_URL=...` (full URL override)
   - `MINIMAX_REMAINS_URL=...` (full URL override)
+- Security policy: endpoint overrides are only accepted when they use `https://`, omit userinfo, and do not contain encoded host delimiters. Custom HTTPS proxy/test domains continue to work for compatibility, but `http://` endpoints are rejected so cookies and authorization headers are not sent in cleartext.
+- Strict provider-host mode: set `MINIMAX_REQUIRE_PROVIDER_ENDPOINT_OVERRIDES=true` to additionally reject custom proxy/test domains and only accept MiniMax-owned hosts under `minimax.io` or `minimaxi.com`.
+
+Transport failures retain their URL error codes and MiniMax diagnostic descriptions, so offline, DNS, and connection
+failures preserve existing usage and qualify for the normal startup retry policy regardless of system language.
+Endpoint fallback, rejected-credential handling, and optional billing enrichment keep their existing behavior.
 
 ## Cookie capture (optional override)
 - Open the Coding Plan page and DevTools → Network.
@@ -62,25 +55,49 @@ either a Bearer API token or a session cookie header.
 - Copy the `Cookie` request header (or use “Copy as cURL” and paste the whole line).
 - Paste into Preferences → Providers → MiniMax only if automatic import fails.
 
-## Notes
-- Cookies alone often return status 1004 (“cookie is missing, log in again”); the remains API expects a Bearer token.
-- MiniMax stores `access_token` in Chromium local storage (LevelDB). Some entries serialize the storage key without a scheme
-  (ex: `minimax.io`), so origin matching must account for host-only keys.
-- Raw JWT scan fallback remains as a safety net if Chromium key formats change.
-- If local storage keys don’t decode (some Chrome builds), the MiniMax-specific text scan avoids a full raw-byte scan.
-
-## Cookie file paths
-- Safari: `~/Library/Cookies/Cookies.binarycookies`
-- Chrome/Chromium forks: `~/Library/Application Support/Google/Chrome/*/Cookies`
-- Firefox: `~/Library/Application Support/Firefox/Profiles/*/cookies.sqlite`
-
 ## Snapshot mapping
-- Primary: percent used from `model_remains` (used/total) or HTML "Available usage".
-- Window: derived from `start_time`/`end_time` or HTML duration text.
-- Reset: derived from `remains_time` (fallback to `end_time`) or HTML "Resets in …".
-- Plan/tier: best-effort from response fields or HTML title.
+- Primary usage, reset timing, and plan/tier are derived from Coding Plan response fields or page text.
+- Unrepresentable integer fields and page durations are ignored without discarding otherwise usable usage percentages.
+- Web-session billing history, when available, is mapped into the shared inline usage dashboard:
+  - 30-day token trend.
+  - Top model and top method breakdowns.
+  - Summary rows for recent billing-history totals.
+
+If the billing-history endpoint is unavailable but normal Coding Plan quota data is present, CodexBar still shows the
+quota card and omits the chart instead of treating the whole provider as failed.
 
 ## Key files
 - `Sources/CodexBarCore/Providers/MiniMax/MiniMaxUsageFetcher.swift`
 - `Sources/CodexBarCore/Providers/MiniMax/MiniMaxProviderDescriptor.swift`
 - `Sources/CodexBar/Providers/MiniMax/MiniMaxProviderImplementation.swift`
+
+## CLI diagnose command
+
+The generic `diagnose` command performs a real provider diagnostic invocation and emits a safe, redacted JSON export
+for issue reporting and verification. MiniMax adds a provider-specific `details` block with safe usage metadata.
+
+### Usage
+```
+codexbar diagnose --provider minimax --format json --pretty
+```
+
+### Output
+- Structural diagnostic JSON with provider, source/source mode, auth summary, usage summary, fetch attempts, and error categories.
+- Per-service quota percentages, used values, limits, remaining values, reset metadata, and unlimited state. These are
+  the same non-secret values shown in the menu and help diagnose boosted quota denominators.
+- All sensitive fields (API tokens, cookies, emails, auth headers) are redacted via `LogRedactor`.
+- Errors are mapped to safe categories (`network`, `auth`, `api`, `parse`) with user-friendly descriptions.
+- No raw API responses, raw error messages, tokens, cookies, emails, account IDs, org IDs, or billing history.
+
+### What is excluded from output
+- Raw API tokens (`sk-cp-*`, `sk-api-*`) and authorization headers
+- Cookie header values
+- Email addresses
+- Account IDs, org IDs
+- Raw error messages (replaced with safe category-based descriptions)
+- Raw HTTP responses or request bodies
+- Billing history details
+
+### Exit codes
+- `0`: Diagnostic completed successfully (even if provider auth is not configured)
+- `1`: Unknown error or invalid arguments

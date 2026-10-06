@@ -5,7 +5,10 @@ import SwiftUI
 @MainActor
 struct CopilotLoginFlow {
     static func run(settings: SettingsStore) async {
-        let flow = CopilotDeviceFlow()
+        let revision = settings.providerConfigRevision(for: .copilot)
+        let enterpriseHost = settings.copilotEnterpriseHost
+        let issuer = CopilotUsageFetcher.apiHost(enterpriseHost: enterpriseHost)
+        let flow = CopilotDeviceFlow(enterpriseHost: enterpriseHost)
 
         do {
             let code = try await flow.requestDeviceCode()
@@ -16,21 +19,17 @@ struct CopilotLoginFlow {
             pb.setString(code.userCode, forType: .string)
 
             let alert = NSAlert()
-            alert.messageText = "GitHub Copilot Login"
-            alert.informativeText = """
-            A device code has been copied to your clipboard: \(code.userCode)
-
-            Please verify it at: \(code.verificationUri)
-            """
-            alert.addButton(withTitle: "Open Browser")
-            alert.addButton(withTitle: "Cancel")
+            alert.messageText = L("GitHub Copilot Login")
+            alert.informativeText = String(format: L("copilot_device_code"), code.userCode, code.verificationUri)
+            alert.addButton(withTitle: L("Open Browser"))
+            alert.addButton(withTitle: L("Cancel"))
 
             let response = alert.runModal()
             if response == .alertSecondButtonReturn {
                 return // Cancelled
             }
 
-            if let url = URL(string: code.verificationUri) {
+            if let url = URL(string: code.verificationURLToOpen) {
                 NSWorkspace.shared.open(url)
             }
 
@@ -43,12 +42,9 @@ struct CopilotLoginFlow {
 
             // Let's show a "Waiting" alert that can be cancelled.
             let waitingAlert = NSAlert()
-            waitingAlert.messageText = "Waiting for Authentication..."
-            waitingAlert.informativeText = """
-            Please complete the login in your browser.
-            This window will close automatically when finished.
-            """
-            waitingAlert.addButton(withTitle: "Cancel")
+            waitingAlert.messageText = L("Waiting for Authentication...")
+            waitingAlert.informativeText = L("copilot_waiting_text")
+            waitingAlert.addButton(withTitle: L("Cancel"))
             let parentWindow = Self.resolveWaitingParentWindow()
             let hostWindow = parentWindow ?? Self.makeWaitingHostWindow()
             let shouldCloseHostWindow = parentWindow == nil
@@ -64,13 +60,7 @@ struct CopilotLoginFlow {
                 return response
             }
 
-            let tokenResult: Result<String, Error>
-            do {
-                let token = try await tokenTask.value
-                tokenResult = .success(token)
-            } catch {
-                tokenResult = .failure(error)
-            }
+            let tokenResult = await tokenTask.result
 
             Self.dismissWaitingAlert(waitingAlert, parentWindow: hostWindow, closeHost: shouldCloseHostWindow)
             let waitResponse = await waitTask.value
@@ -80,29 +70,167 @@ struct CopilotLoginFlow {
 
             switch tokenResult {
             case let .success(token):
-                settings.copilotAPIToken = token
-                settings.setProviderEnabled(
-                    provider: .copilot,
-                    metadata: ProviderRegistry.shared.metadata[.copilot]!,
-                    enabled: true)
+                // Fetch username for account label.
+                // If accounts already exist, fail closed when identity lookup fails so re-auth cannot create
+                // an anonymous duplicate with stale credentials left on the original account.
+                let label: String
+                let identity: CopilotUsageFetcher.GitHubUserIdentity?
+                do {
+                    let resolvedIdentity = try await CopilotUsageFetcher.fetchGitHubIdentity(
+                        token: token, enterpriseHost: enterpriseHost)
+                    let usage = try? await CopilotUsageFetcher(token: token, enterpriseHost: enterpriseHost).fetch()
+                    let plan = usage?.identity(for: .copilot)?.loginMethod ?? ""
+                    identity = resolvedIdentity
+                    label = plan.isEmpty ? resolvedIdentity.login : "\(resolvedIdentity.login) (\(plan))"
+                } catch {
+                    guard settings.tokenAccounts(for: .copilot).isEmpty, issuer == "api.github.com" else {
+                        let err = NSAlert()
+                        err.messageText = L("Could Not Identify GitHub Account")
+                        err.informativeText = L(
+                            "GitHub login succeeded, but CodexBar could not verify which " +
+                                "account it belongs to. Please try again.")
+                        err.runModal()
+                        return
+                    }
+                    identity = nil
+                    label = "Account 1"
+                }
+
+                guard let wasRefresh = await Self.storeLoginIfCurrent(
+                    settings: settings, revision: revision, token: token, identity: identity, label: label)
+                else { return }
 
                 let success = NSAlert()
-                success.messageText = "Login Successful"
+                success.messageText = wasRefresh ? L("Token Refreshed") : L("Account Added")
+                success.informativeText = label
                 success.runModal()
             case let .failure(error):
                 guard !(error is CancellationError) else { return }
-                let err = NSAlert()
-                err.messageText = "Login Failed"
-                err.informativeText = error.localizedDescription
-                err.runModal()
+                throw error
             }
 
         } catch {
             let err = NSAlert()
-            err.messageText = "Login Failed"
+            err.messageText = L("Login Failed")
             err.informativeText = error.localizedDescription
             err.runModal()
         }
+    }
+
+    static func storeLoginIfCurrent(
+        settings: SettingsStore,
+        revision: UInt64,
+        token: String,
+        identity: CopilotUsageFetcher.GitHubUserIdentity?,
+        label: String,
+        legacyIdentityResolver: @escaping @Sendable (ProviderTokenAccount) async
+            -> CopilotUsageFetcher.GitHubUserIdentity? = { account in
+                try? await CopilotUsageFetcher.fetchGitHubIdentity(token: account.token)
+            }) async -> Bool?
+    {
+        guard settings.providerConfigRevision(for: .copilot) == revision else { return nil }
+        let issuer = CopilotUsageFetcher.apiHost(enterpriseHost: settings.copilotEnterpriseHost)
+        let matchedExisting = await Self.matchExistingAccount(
+            existingAccounts: settings.tokenAccounts(for: .copilot),
+            identity: identity,
+            label: label,
+            issuer: issuer,
+            legacyIdentityResolver: legacyIdentityResolver)
+        guard !Task.isCancelled,
+              settings.providerConfigRevision(for: .copilot) == revision,
+              identity != nil || issuer == "api.github.com" && settings.tokenAccounts(for: .copilot).isEmpty
+        else { return nil }
+        let externalIdentifier = identity.map { Self.externalIdentifier(for: $0, issuer: issuer) }
+        if let existing = matchedExisting {
+            settings.updateTokenAccount(
+                provider: .copilot,
+                accountID: existing.id,
+                label: label,
+                token: token,
+                externalIdentifier: .some(externalIdentifier))
+        } else {
+            settings.addTokenAccount(
+                provider: .copilot,
+                label: label,
+                token: token,
+                externalIdentifier: externalIdentifier)
+        }
+        settings.setProviderEnabled(
+            provider: .copilot,
+            metadata: ProviderRegistry.shared.metadata[.copilot]!,
+            enabled: true)
+
+        return matchedExisting != nil
+    }
+
+    static func matchExistingAccount(
+        existingAccounts: [ProviderTokenAccount],
+        identity: CopilotUsageFetcher.GitHubUserIdentity?,
+        label: String,
+        issuer: String = "api.github.com",
+        legacyIdentityResolver: @escaping @Sendable (ProviderTokenAccount) async
+            -> CopilotUsageFetcher.GitHubUserIdentity? = { account in
+                try? await CopilotUsageFetcher.fetchGitHubIdentity(token: account.token)
+            }) async -> ProviderTokenAccount?
+    {
+        guard let identity, !existingAccounts.isEmpty else { return nil }
+        let stableIdentifier = self.externalIdentifier(for: identity, issuer: issuer)
+        let login = self.normalizedGitHubLogin(identity.login)
+
+        if let byID = existingAccounts.first(where: { account in
+            self.normalizedExternalIdentifier(account.externalIdentifier) == stableIdentifier
+        }) {
+            return byID
+        }
+
+        // Hostless legacy identifiers belong to the existing public-GitHub path.
+        guard issuer == "api.github.com" else { return nil }
+
+        // Previous PR revisions stored GitHub login in externalIdentifier. Keep matching those
+        // accounts case-insensitively, then write back the stable ID on update.
+        if let byLegacyLogin = existingAccounts.first(where: { account in
+            self.normalizedGitHubLogin(account.externalIdentifier) == login
+        }) {
+            return byLegacyLogin
+        }
+
+        var labelFallback: ProviderTokenAccount?
+        for account in existingAccounts where account.externalIdentifier == nil {
+            if let resolvedIdentity = await legacyIdentityResolver(account) {
+                if resolvedIdentity.id == identity.id {
+                    return account
+                }
+            } else if labelFallback == nil,
+                      self.displayLabelPrefix(account.label) == self.displayLabelPrefix(label)
+            {
+                labelFallback = account
+            }
+        }
+        return labelFallback
+    }
+
+    static func externalIdentifier(
+        for identity: CopilotUsageFetcher.GitHubUserIdentity,
+        issuer: String = "api.github.com") -> String
+    {
+        issuer == "api.github.com" ? "github:user:\(identity.id)" : "github:\(issuer):user:\(identity.id)"
+    }
+
+    private static func normalizedExternalIdentifier(_ identifier: String?) -> String? {
+        let trimmed = identifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed.lowercased()
+    }
+
+    private static func normalizedGitHubLogin(_ login: String?) -> String? {
+        guard let normalized = self.normalizedExternalIdentifier(login), !normalized.hasPrefix("github:")
+        else { return nil }
+        return normalized
+    }
+
+    private static func displayLabelPrefix(_ label: String) -> String {
+        (label.components(separatedBy: " (").first ?? label)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 
     @MainActor

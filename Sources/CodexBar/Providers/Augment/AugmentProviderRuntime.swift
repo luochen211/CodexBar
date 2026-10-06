@@ -4,7 +4,17 @@ import Foundation
 @MainActor
 final class AugmentProviderRuntime: ProviderRuntime {
     let id: UsageProvider = .augment
+    private var keepaliveGeneration = UUID()
     private var keepalive: AugmentSessionKeepalive?
+    #if DEBUG
+    var _test_clearCookieCache: (() -> Void)?
+    private(set) var _test_keepaliveStopCount = 0
+    var _test_isKeepaliveRunning: Bool {
+        self.keepalive != nil
+    }
+    #endif
+
+    nonisolated init() {}
 
     func start(context: ProviderRuntimeContext) {
         self.updateKeepalive(context: context)
@@ -22,9 +32,10 @@ final class AugmentProviderRuntime: ProviderRuntime {
         guard provider == .augment else { return }
         let message = error.localizedDescription
         guard message.contains("session expired") else { return }
+        guard let keepalive = self.keepalive else { return }
         context.store.augmentLogger.warning("Augment session expired; triggering recovery")
-        Task { [weak self] in
-            guard let self else { return }
+        Task { [weak self, weak keepalive] in
+            guard let self, let keepalive, self.keepalive === keepalive else { return }
             await self.forceRefresh(context: context)
         }
     }
@@ -70,12 +81,24 @@ final class AugmentProviderRuntime: ProviderRuntime {
         }
 
         let onSessionRecovered: () async -> Void = { [weak store = context.store] in
-            guard let store else { return }
+            guard let store, !Task.isCancelled, store.isEnabled(.augment) else { return }
             store.augmentLogger.info("Augment session recovered; refreshing usage")
             await store.refreshProvider(.augment)
         }
 
-        self.keepalive = AugmentSessionKeepalive(logger: logger, onSessionRecovered: onSessionRecovered)
+        let generation = UUID()
+        self.keepaliveGeneration = generation
+        self.keepalive = AugmentSessionKeepalive(
+            logger: logger,
+            onSessionRecovered: onSessionRecovered,
+            onLoginRequired: { [weak self, weak store = context.store] in
+                guard let self, let store, store.isEnabled(.augment),
+                      self.keepaliveGeneration == generation else { return }
+                store.handleCredentialOutcome(
+                    provider: .augment,
+                    result: .failure(AugmentStatusProbeError.sessionExpired),
+                    isCurrent: { [weak self] in self?.keepaliveGeneration == generation })
+            })
         self.keepalive?.start()
         context.store.augmentLogger.info("Augment keepalive started")
         #endif
@@ -83,30 +106,38 @@ final class AugmentProviderRuntime: ProviderRuntime {
 
     private func stopKeepalive(context: ProviderRuntimeContext, reason: String) {
         #if os(macOS)
-        self.keepalive?.stop()
+        guard let keepalive = self.keepalive else { return }
+        self.keepaliveGeneration = UUID()
+        context.store.retireCredentialNotifications(provider: .augment)
+        keepalive.stop()
         self.keepalive = nil
+        #if DEBUG
+        self._test_keepaliveStopCount += 1
+        #endif
         context.store.augmentLogger.info("Augment keepalive stopped (\(reason))")
         #endif
     }
 
     private func forceRefresh(context: ProviderRuntimeContext) async {
         #if os(macOS)
+        guard !Task.isCancelled, context.store.isEnabled(.augment) else { return }
         context.store.augmentLogger.info("Augment force refresh requested")
-        guard let keepalive = self.keepalive else {
+        self.clearCookieCache()
+        if self.keepalive == nil {
             context.store.augmentLogger.warning("Augment keepalive not running; starting")
             self.startKeepalive(context: context)
-            try? await Task.sleep(for: .seconds(1))
-            guard let keepalive = self.keepalive else {
-                context.store.augmentLogger.error("Augment keepalive failed to start")
-                return
-            }
-            await keepalive.forceRefresh()
+        }
+        await self.keepalive?.forceRefresh()
+        #endif
+    }
+
+    private func clearCookieCache() {
+        #if DEBUG
+        if let override = self._test_clearCookieCache {
+            override()
             return
         }
-
-        await keepalive.forceRefresh()
-        context.store.augmentLogger.info("Refreshing Augment usage after session refresh")
-        await context.store.refreshProvider(.augment)
         #endif
+        CookieHeaderCache.clear(provider: .augment)
     }
 }

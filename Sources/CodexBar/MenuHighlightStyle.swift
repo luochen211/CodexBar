@@ -2,6 +2,10 @@ import SwiftUI
 
 extension EnvironmentValues {
     @Entry var menuItemHighlighted: Bool = false
+    /// Optional live-refresh monitor injected into menu card views so the provider card
+    /// subtitle can reflect the in-flight "Refreshing…" state in place while the NSMenu
+    /// stays open, without rebuilding the menu during AppKit tracking.
+    @Entry var menuCardRefreshMonitor: MenuCardRefreshMonitor?
 }
 
 enum MenuHighlightStyle {
@@ -19,6 +23,12 @@ enum MenuHighlightStyle {
 
     static func error(_ highlighted: Bool) -> Color {
         highlighted ? self.selectionText : Color(nsColor: .systemRed)
+    }
+
+    /// Emphasis for a card's status label (for example the active account).
+    /// A highlighted row still uses the selection color so contrast is kept.
+    static func accent(_ highlighted: Bool) -> Color {
+        highlighted ? self.selectionText : Color(nsColor: .controlAccentColor)
     }
 
     static func progressTrack(_ highlighted: Bool) -> Color {

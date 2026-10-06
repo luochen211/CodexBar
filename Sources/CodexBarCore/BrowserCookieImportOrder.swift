@@ -1,27 +1,35 @@
 #if os(macOS)
 import SweetCookieKit
-
-public typealias BrowserCookieImportOrder = [Browser]
 #else
 public struct Browser: Sendable, Hashable {
     public init() {}
 }
 
-public typealias BrowserCookieImportOrder = [Browser]
 #endif
+
+public typealias BrowserCookieImportOrder = [Browser]
 
 extension [Browser] {
     /// Filters a browser list to sources worth attempting for cookie imports.
     ///
     /// This is intentionally stricter than "app installed": it aims to avoid unnecessary Keychain prompts.
     public func cookieImportCandidates(using detection: BrowserDetection) -> [Browser] {
-        let candidates = self.filter { browser in
+        Array(self.lazyCookieImportCandidates(using: detection))
+    }
+
+    /// Lazily filters browser sources so callers can stop after the first successful cookie import.
+    func lazyCookieImportCandidates(using detection: BrowserDetection) -> some Sequence<Browser> {
+        self.lazy.filter { browser in
             if KeychainAccessGate.isDisabled, browser.usesKeychainForCookieDecryption {
+                #if os(macOS)
+                if KeychainAccessGate.isExplicitlyDisabled {
+                    BrowserCookieAccessGate.recordAccessFailure(for: browser)
+                }
+                #endif
                 return false
             }
-            return detection.isCookieSourceAvailable(browser)
+            return detection.isCookieSourceAvailable(browser) && BrowserCookieAccessGate.shouldAttempt(browser)
         }
-        return candidates.filter { BrowserCookieAccessGate.shouldAttempt($0) }
     }
 
     /// Filters a browser list to sources with usable profile data on disk.
@@ -33,22 +41,7 @@ extension [Browser] {
 #if os(macOS)
 extension Browser {
     var usesKeychainForCookieDecryption: Bool {
-        switch self {
-        case .safari, .firefox, .zen:
-            return false
-        case .chrome, .chromeBeta, .chromeCanary,
-             .arc, .arcBeta, .arcCanary,
-             .chatgptAtlas,
-             .chromium,
-             .brave, .braveBeta, .braveNightly,
-             .edge, .edgeBeta, .edgeCanary,
-             .helium,
-             .vivaldi,
-             .dia:
-            return true
-        @unknown default:
-            return true
-        }
+        self != .safari && !self.usesGeckoProfileStore
     }
 }
 #else

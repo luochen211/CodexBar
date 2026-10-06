@@ -5,21 +5,320 @@ import FoundationNetworking
 #endif
 
 public struct KimiUsageFetcher: Sendable {
-    private static let log = CodexBarLog.logger(LogCategories.kimiAPI)
-    private static let usageURL =
-        URL(string: "https://www.kimi.com/apiv2/kimi.gateway.billing.v1.BillingService/GetUsages")!
+    private static let log = CodexBarLog.logger(LogCategories.provider(.kimi, scope: "api"))
+    private static let subscriptionGraceSeconds: TimeInterval = 2
 
-    public static func fetchUsage(authToken: String, now: Date = Date()) async throws -> KimiUsageSnapshot {
-        // Decode JWT to get session info
+    public static func fetchCodeAPIUsage(
+        apiKey: String,
+        region: KimiRegion = .china,
+        baseURL: URL? = nil,
+        identityHeaders: [String: String] = [:],
+        webAuthToken: String? = nil,
+        now: Date = Date(),
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> KimiUsageSnapshot
+    {
+        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw KimiAPIError.missingAPIKey
+        }
+
+        guard let validatedBaseURL = ProviderEndpointOverrideValidator()
+            .validatedURL((baseURL ?? region.apiBaseURL).absoluteString)
+        else {
+            throw KimiAPIError.invalidRequest("Kimi Code API base URL must use HTTPS without user info")
+        }
+
+        let endpoint = self.codeAPIUsageEndpoint(baseURL: validatedBaseURL)
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "GET"
+        for (name, value) in identityHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let response = try await transport.response(for: request)
+        let data = response.data
+        guard response.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "<binary data>"
+            Self.log.error("Kimi Code API returned \(response.statusCode): \(responseBody)")
+            throw self.codeAPIError(statusCode: response.statusCode)
+        }
+
+        let snapshot = try self.parseCodeAPIUsage(from: data, now: now)
+        guard let webAuthToken else { return snapshot }
+        return try await self.enrichCodeAPIUsage(
+            snapshot,
+            webAuthToken: webAuthToken,
+            region: region,
+            now: now,
+            transport: transport)
+    }
+
+    public static func fetchUsage(
+        authToken: String,
+        region: KimiRegion = .china,
+        now: Date = Date(),
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared,
+        subscriptionGrace: Duration? = nil) async throws -> KimiUsageSnapshot
+    {
         let sessionInfo = self.decodeSessionInfo(from: authToken)
 
-        var request = URLRequest(url: self.usageURL)
+        let enrichment = SubscriptionEnrichment(
+            authToken: authToken,
+            region: region,
+            sessionInfo: sessionInfo,
+            transport: transport,
+            grace: subscriptionGrace ?? .seconds(self.subscriptionGraceSeconds))
+
+        let codingUsage: KimiUsage
+        do {
+            codingUsage = try await withTaskCancellationHandler {
+                try await self.fetchRequiredUsage(
+                    authToken: authToken,
+                    region: region,
+                    sessionInfo: sessionInfo,
+                    transport: transport)
+            } onCancel: {
+                enrichment.cancel()
+            }
+        } catch {
+            enrichment.cancel()
+            _ = try? await enrichment.value()
+            throw error
+        }
+
+        let subscription = try await enrichment.value()
+
+        let rateLimit = codingUsage.limits?.first
+        return KimiUsageSnapshot(
+            weekly: codingUsage.detail,
+            rateLimit: rateLimit?.detail,
+            rateLimitWindow: rateLimit?.window,
+            subscriptionBalance: subscription.stats?.subscriptionBalance,
+            subscriptionCodeWeeklyLimit: subscription.stats?.ratelimitCode7d,
+            planName: subscription.planName,
+            updatedAt: now)
+    }
+
+    private static func fetchRequiredUsage(
+        authToken: String,
+        region: KimiRegion = .china,
+        sessionInfo: SessionInfo?,
+        transport: any ProviderHTTPTransport) async throws -> KimiUsage
+    {
+        var request = self.webRequest(
+            url: region.webBaseURL.appendingPathComponent("apiv2/kimi.gateway.billing.v1.BillingService/GetUsages"),
+            authToken: authToken,
+            sessionInfo: sessionInfo)
+        let requestBody = ["scope": ["FEATURE_CODING"]]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
+
+        let response = try await transport.response(for: request)
+        let data = response.data
+        guard response.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "<binary data>"
+            Self.log.error("Kimi API returned \(response.statusCode): \(responseBody)")
+
+            if response.statusCode == 401 || response.statusCode == 403 {
+                throw KimiAPIError.invalidToken
+            }
+            if response.statusCode == 400 {
+                throw KimiAPIError.invalidRequest("Bad request")
+            }
+            throw KimiAPIError.apiError("HTTP \(response.statusCode)")
+        }
+
+        let usageResponse = try JSONDecoder().decode(KimiUsageResponse.self, from: data)
+        guard let codingUsage = usageResponse.usages.first(where: { $0.scope == "FEATURE_CODING" }) else {
+            throw KimiAPIError.parseFailed("FEATURE_CODING scope not found in response")
+        }
+
+        return codingUsage
+    }
+
+    private static func enrichCodeAPIUsage(
+        _ snapshot: KimiUsageSnapshot,
+        webAuthToken: String,
+        region: KimiRegion,
+        now: Date,
+        transport: any ProviderHTTPTransport) async throws -> KimiUsageSnapshot
+    {
+        let sessionInfo = self.decodeSessionInfo(from: webAuthToken)
+        let enrichment = SubscriptionEnrichment(
+            authToken: webAuthToken,
+            region: region,
+            sessionInfo: sessionInfo,
+            transport: transport,
+            grace: .seconds(self.subscriptionGraceSeconds),
+            includePlan: snapshot.planName == nil)
+        let subscription = try await enrichment.value()
+        return KimiUsageSnapshot(
+            weekly: snapshot.weekly,
+            rateLimit: snapshot.rateLimit,
+            rateLimitWindow: snapshot.rateLimitWindow,
+            subscriptionBalance: subscription.stats?.subscriptionBalance,
+            subscriptionCodeWeeklyLimit: subscription.stats?.ratelimitCode7d,
+            codeUsagePools: snapshot.codeUsagePools,
+            planName: snapshot.planName ?? subscription.planName,
+            updatedAt: now)
+    }
+
+    static func parseCodeAPIUsage(from data: Data, now: Date = Date()) throws -> KimiUsageSnapshot {
+        let response = try JSONDecoder().decode(KimiCodeAPIUsageResponse.self, from: data)
+        let rateLimit = response.limits?.first
+        let snapshot = KimiUsageSnapshot(
+            weekly: response.usage,
+            rateLimit: rateLimit?.detail,
+            rateLimitWindow: rateLimit?.window,
+            subscriptionBalance: nil,
+            codeUsagePools: response.usages,
+            planName: response.planName,
+            updatedAt: now)
+        let usage = snapshot.toUsageSnapshot()
+        guard usage.primary != nil || usage.secondary != nil || usage.extraRateWindows?.isEmpty == false else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: [],
+                debugDescription: "No supported quota windows in Code usage response"))
+        }
+        return snapshot
+    }
+
+    static func codeAPIUsageEndpoint(baseURL: URL) -> URL {
+        let normalizedPath = baseURL.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if normalizedPath == "coding/v1" || normalizedPath.hasSuffix("/coding/v1") {
+            return baseURL.appendingPathComponent("usages")
+        }
+        if normalizedPath == "coding" || normalizedPath.hasSuffix("/coding") {
+            return baseURL.appendingPathComponent("v1/usages")
+        }
+
+        return baseURL.appendingPathComponent("coding/v1/usages")
+    }
+
+    private static func fetchPlan(
+        authToken: String,
+        region: KimiRegion = .china,
+        sessionInfo: SessionInfo?,
+        transport: any ProviderHTTPTransport) async throws -> String?
+    {
+        let url = region.webBaseURL
+            .appendingPathComponent("apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription")
+        var request = self.webRequest(url: url, authToken: authToken, sessionInfo: sessionInfo)
+        request.httpBody = Data("{}".utf8)
+        request.timeoutInterval = self.subscriptionGraceSeconds
+        let response = try await transport.response(for: request)
+        guard response.statusCode == 200 else { return nil }
+        return try JSONDecoder().decode(KimiSubscriptionResponse.self, from: response.data).planName
+    }
+
+    /// Statistics and the optional title share a deadline, but neither can discard the other's completed result.
+    private struct SubscriptionEnrichment: Sendable {
+        let stats: Task<BoundedTaskJoinOutcome<KimiSubscriptionStatsResponse?>, Never>
+        let plan: Task<BoundedTaskJoinOutcome<String?>, Never>
+
+        init(
+            authToken: String,
+            region: KimiRegion,
+            sessionInfo: SessionInfo?,
+            transport: any ProviderHTTPTransport,
+            grace: Duration,
+            includePlan: Bool = true)
+        {
+            let deadline = ContinuousClock.now.advanced(by: grace)
+            let statsTask = Task {
+                try Task.checkCancellation()
+                return try await KimiUsageFetcher.fetchUsageStats(
+                    authToken: authToken,
+                    region: region,
+                    sessionInfo: sessionInfo,
+                    transport: transport)
+            }
+            let planTask = Task<String?, Error> {
+                try Task.checkCancellation()
+                guard includePlan else { return nil }
+                return try await KimiUsageFetcher.fetchPlan(
+                    authToken: authToken,
+                    region: region,
+                    sessionInfo: sessionInfo,
+                    transport: transport)
+            }
+            self.stats = Task {
+                await BoundedTaskJoin(sourceTask: statsTask)
+                    .value(joinGrace: ContinuousClock.now.duration(to: deadline))
+            }
+            self.plan = Task {
+                await BoundedTaskJoin(sourceTask: planTask).value(joinGrace: ContinuousClock.now.duration(to: deadline))
+            }
+        }
+
+        func cancel() {
+            self.stats.cancel()
+            self.plan.cancel()
+        }
+
+        func value() async throws -> (stats: KimiSubscriptionStatsResponse?, planName: String?) {
+            let outcomes = await withTaskCancellationHandler {
+                let stats = await self.stats.value
+                let plan = await self.plan.value
+                return (stats, plan)
+            } onCancel: {
+                self.cancel()
+            }
+            try Task.checkCancellation()
+            return try (
+                Self.optionalValue(outcomes.0, label: "subscription stats"),
+                Self.optionalValue(outcomes.1, label: "plan"))
+        }
+
+        private static func optionalValue<Value: Sendable>(
+            _ outcome: BoundedTaskJoinOutcome<Value?>,
+            label: String) throws -> Value?
+        {
+            switch outcome {
+            case let .value(value): return value
+            case .timedOut:
+                KimiUsageFetcher.log.warning("Kimi \(label) timed out")
+                return nil
+            case let .failure(error):
+                if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                    throw CancellationError()
+                }
+                KimiUsageFetcher.log.warning("Kimi \(label) unavailable: \(error.localizedDescription)")
+                return nil
+            }
+        }
+    }
+
+    private static func fetchUsageStats(
+        authToken: String,
+        region: KimiRegion = .china,
+        sessionInfo: SessionInfo?,
+        transport: any ProviderHTTPTransport) async throws -> KimiSubscriptionStatsResponse?
+    {
+        var request = self.webRequest(
+            url: region.webBaseURL
+                .appendingPathComponent("apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"),
+            authToken: authToken,
+            sessionInfo: sessionInfo)
+        request.httpBody = Data("{}".utf8)
+
+        let response = try await transport.response(for: request)
+        guard response.statusCode == 200 else {
+            Self.log.warning("Kimi subscription stats returned \(response.statusCode)")
+            return nil
+        }
+        return try JSONDecoder().decode(KimiSubscriptionStatsResponse.self, from: response.data)
+    }
+
+    private static func webRequest(url: URL, authToken: String, sessionInfo: SessionInfo?) -> URLRequest {
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         request.setValue("kimi-auth=\(authToken)", forHTTPHeaderField: "Cookie")
-        request.setValue("https://www.kimi.com", forHTTPHeaderField: "Origin")
-        request.setValue("https://www.kimi.com/code/console", forHTTPHeaderField: "Referer")
+        let origin = "https://\(url.host!)"
+        request.setValue(origin, forHTTPHeaderField: "Origin")
+        request.setValue("\(origin)/code/console", forHTTPHeaderField: "Referer")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
@@ -30,73 +329,34 @@ public struct KimiUsageFetcher: Sendable {
         request.setValue("web", forHTTPHeaderField: "x-msh-platform")
         request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "r-timezone")
 
-        // Add session-specific headers from JWT
-        if let sessionInfo {
-            if let deviceId = sessionInfo.deviceId {
-                request.setValue(deviceId, forHTTPHeaderField: "x-msh-device-id")
-            }
-            if let sessionId = sessionInfo.sessionId {
-                request.setValue(sessionId, forHTTPHeaderField: "x-msh-session-id")
-            }
-            if let trafficId = sessionInfo.trafficId {
-                request.setValue(trafficId, forHTTPHeaderField: "x-traffic-id")
-            }
+        if let deviceId = sessionInfo?.deviceId {
+            request.setValue(deviceId, forHTTPHeaderField: "x-msh-device-id")
         }
-
-        let requestBody = ["scope": ["FEATURE_CODING"]]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw KimiAPIError.networkError("Invalid response")
+        if let sessionId = sessionInfo?.sessionId {
+            request.setValue(sessionId, forHTTPHeaderField: "x-msh-session-id")
         }
-
-        guard httpResponse.statusCode == 200 else {
-            let responseBody = String(data: data, encoding: .utf8) ?? "<binary data>"
-            Self.log.error("Kimi API returned \(httpResponse.statusCode): \(responseBody)")
-
-            if httpResponse.statusCode == 401 {
-                throw KimiAPIError.invalidToken
-            }
-            if httpResponse.statusCode == 403 {
-                throw KimiAPIError.invalidToken
-            }
-            if httpResponse.statusCode == 400 {
-                throw KimiAPIError.invalidRequest("Bad request")
-            }
-            throw KimiAPIError.apiError("HTTP \(httpResponse.statusCode)")
+        if let trafficId = sessionInfo?.trafficId {
+            request.setValue(trafficId, forHTTPHeaderField: "x-traffic-id")
         }
+        return request
+    }
 
-        let usageResponse = try JSONDecoder().decode(KimiUsageResponse.self, from: data)
-        guard let codingUsage = usageResponse.usages.first(where: { $0.scope == "FEATURE_CODING" }) else {
-            throw KimiAPIError.parseFailed("FEATURE_CODING scope not found in response")
+    static func codeAPIError(statusCode: Int) -> KimiAPIError {
+        switch statusCode {
+        case 400:
+            .invalidRequest("Bad request")
+        case 401:
+            .invalidAPIKey
+        case 403:
+            .apiError("HTTP 403 (permission or quota denied)")
+        default:
+            .apiError("HTTP \(statusCode)")
         }
-
-        return KimiUsageSnapshot(
-            weekly: codingUsage.detail,
-            rateLimit: codingUsage.limits?.first?.detail,
-            updatedAt: now)
     }
 
     private static func decodeSessionInfo(from jwt: String) -> SessionInfo? {
-        let parts = jwt.split(separator: ".", maxSplits: 2)
-        guard parts.count == 3 else { return nil }
-
-        // Convert base64url to base64 for JWT decoding
-        // base64url uses - and _ instead of + and /
-        var payload = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        // Add padding if needed
-        while payload.count % 4 != 0 {
-            payload += "="
-        }
-
-        guard let payloadData = Data(base64Encoded: payload),
-              let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
-        else {
-            return nil
-        }
+        guard jwt.split(separator: ".", maxSplits: 2).count == 3,
+              let json = UsageFetcher.parseJWT(jwt) else { return nil }
 
         return SessionInfo(
             deviceId: json["device_id"] as? String,
@@ -104,7 +364,7 @@ public struct KimiUsageFetcher: Sendable {
             trafficId: json["sub"] as? String)
     }
 
-    private struct SessionInfo {
+    private struct SessionInfo: Sendable {
         let deviceId: String?
         let sessionId: String?
         let trafficId: String?

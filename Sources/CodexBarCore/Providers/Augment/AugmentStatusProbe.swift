@@ -15,12 +15,15 @@ public enum AugmentCookieImporter {
     /// NOTE: This list may not be exhaustive. If authentication fails with cookies present,
     /// check debug logs for cookie names and report them.
     private static let sessionCookieNames: Set<String> = [
-        "_session", // Legacy session cookie
+        "session", // Augment auth session (auth.augmentcode.com)
+        "_session", // Legacy session cookie (app.augmentcode.com)
+        "web_rpc_proxy_session", // Augment RPC proxy session
         "auth0", // Auth0 session
         "auth0.is.authenticated", // Auth0 authentication flag
         "a0.spajs.txs", // Auth0 SPA transaction state
         "__Secure-next-auth.session-token", // NextAuth secure session
         "next-auth.session-token", // NextAuth session
+        "__Secure-authjs.session-token", // AuthJS secure session
         "__Host-authjs.csrf-token", // AuthJS CSRF token
         "authjs.session-token", // AuthJS session
     ]
@@ -67,7 +70,7 @@ public enum AugmentCookieImporter {
         for browserSource in augmentCookieImportOrder {
             do {
                 let query = BrowserCookieQuery(domains: cookieDomains)
-                let sources = try Self.cookieClient.records(
+                let sources = try Self.cookieClient.codexBarRecords(
                     matching: query,
                     in: browserSource,
                     logger: log)
@@ -131,6 +134,10 @@ public struct AugmentCreditsResponse: Codable, Sendable {
     }
 
     public var creditsLimit: Double? {
+        if let available = self.usageUnitsAvailable, available > 0 {
+            return available
+        }
+
         guard let remaining = self.usageUnitsRemaining,
               let consumed = self.usageUnitsConsumedThisBillingCycle
         else {
@@ -222,6 +229,7 @@ public struct AugmentStatusSnapshot: Sendable {
 
     private static func formatResetDate(_ date: Date) -> String {
         let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "en_US")
         formatter.unitsStyle = .full
         return formatter.localizedString(for: date, relativeTo: Date())
     }
@@ -261,19 +269,18 @@ public actor AugmentSessionStore {
     private var hasLoadedFromDisk = false
     private let fileURL: URL
 
-    private init() {
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fm.temporaryDirectory
-        let dir = appSupport.appendingPathComponent("CodexBar", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.fileURL = dir.appendingPathComponent("augment-session.json")
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? ProviderSessionStoreFile.url(for: "augment-session.json")
+        guard fileURL == nil else { return }
+        try? FileManager.default.createDirectory(
+            at: self.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         // Load saved cookies on init
         Task { await self.loadFromDiskIfNeeded() }
     }
 
     public func setCookies(_ cookies: [HTTPCookie]) {
+        guard !Task.isCancelled else { return }
         self.hasLoadedFromDisk = true
         self.sessionCookies = cookies
         self.saveToDisk()
@@ -308,40 +315,20 @@ public actor AugmentSessionStore {
     private func loadFromDiskIfNeeded() {
         guard !self.hasLoadedFromDisk else { return }
         self.hasLoadedFromDisk = true
+        CredentialFileWriter.repairPermissions(at: self.fileURL)
         self.loadFromDisk()
     }
 
     private func saveToDisk() {
         // Convert cookie properties to JSON-serializable format
         // Date values must be converted to TimeInterval (Double)
-        let cookieData = self.sessionCookies.compactMap { cookie -> [String: Any]? in
-            guard let props = cookie.properties else { return nil }
-            var serializable: [String: Any] = [:]
-            for (key, value) in props {
-                let keyString = key.rawValue
-                if let date = value as? Date {
-                    // Convert Date to TimeInterval for JSON compatibility
-                    serializable[keyString] = date.timeIntervalSince1970
-                    serializable[keyString + "_isDate"] = true
-                } else if let url = value as? URL {
-                    serializable[keyString] = url.absoluteString
-                    serializable[keyString + "_isURL"] = true
-                } else if JSONSerialization.isValidJSONObject([value]) ||
-                    value is String ||
-                    value is Bool ||
-                    value is NSNumber
-                {
-                    serializable[keyString] = value
-                }
-            }
-            return serializable
-        }
+        let cookieData = CookiePropertyJSON.encode(self.sessionCookies)
         guard !cookieData.isEmpty,
               let data = try? JSONSerialization.data(withJSONObject: cookieData, options: [.prettyPrinted])
         else {
             return
         }
-        try? data.write(to: self.fileURL)
+        try? CredentialFileWriter.writePrivate(data, to: self.fileURL)
     }
 
     private func loadFromDisk() {
@@ -349,28 +336,7 @@ public actor AugmentSessionStore {
               let cookieArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else { return }
 
-        self.sessionCookies = cookieArray.compactMap { props in
-            // Convert back to HTTPCookiePropertyKey dictionary
-            var cookieProps: [HTTPCookiePropertyKey: Any] = [:]
-            for (key, value) in props {
-                // Skip marker keys
-                if key.hasSuffix("_isDate") || key.hasSuffix("_isURL") { continue }
-
-                let propKey = HTTPCookiePropertyKey(key)
-
-                // Check if this was a Date
-                if props[key + "_isDate"] as? Bool == true, let interval = value as? TimeInterval {
-                    cookieProps[propKey] = Date(timeIntervalSince1970: interval)
-                }
-                // Check if this was a URL
-                else if props[key + "_isURL"] as? Bool == true, let urlString = value as? String {
-                    cookieProps[propKey] = URL(string: urlString)
-                } else {
-                    cookieProps[propKey] = value
-                }
-            }
-            return HTTPCookie(properties: cookieProps)
-        }
+        self.sessionCookies = CookiePropertyJSON.decode(cookieArray)
     }
 }
 
@@ -492,7 +458,7 @@ public struct AugmentStatusProbe: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderHTTPClient.shared.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AugmentStatusProbeError.networkError("Invalid response")
@@ -530,7 +496,7 @@ public struct AugmentStatusProbe: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderHTTPClient.shared.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AugmentStatusProbeError.networkError("Invalid response")
@@ -589,14 +555,16 @@ public struct AugmentStatusProbe: Sendable {
     }
 
     /// Debug probe that returns raw API responses
-    public func debugRawProbe() async -> String {
+    public func debugRawProbe(cookieHeaderOverride: String? = nil) async -> String {
         let stamp = ISO8601DateFormatter().string(from: Date())
         var lines: [String] = []
         lines.append("=== Augment Debug Probe @ \(stamp) ===")
         lines.append("")
 
         do {
-            let snapshot = try await self.fetch(logger: { msg in lines.append("[log] \(msg)") })
+            let snapshot = try await self.fetch(
+                cookieHeaderOverride: cookieHeaderOverride,
+                logger: { msg in lines.append("[log] \(msg)") })
             lines.append("")
             lines.append("Probe Success")
             lines.append("")
@@ -616,13 +584,13 @@ public struct AugmentStatusProbe: Sendable {
             }
 
             let output = lines.joined(separator: "\n")
-            Task { @MainActor in Self.recordDump(output) }
+            await MainActor.run { Self.recordDump(output) }
             return output
         } catch {
             lines.append("")
             lines.append("Probe Failed: \(error.localizedDescription)")
             let output = lines.joined(separator: "\n")
-            Task { @MainActor in Self.recordDump(output) }
+            await MainActor.run { Self.recordDump(output) }
             return output
         }
     }
@@ -632,7 +600,9 @@ public struct AugmentStatusProbe: Sendable {
     @MainActor private static var recentDumps: [String] = []
 
     @MainActor private static func recordDump(_ text: String) {
-        if self.recentDumps.count >= 5 { self.recentDumps.removeFirst() }
+        if self.recentDumps.count >= 5 {
+            self.recentDumps.removeFirst()
+        }
         self.recentDumps.append(text)
     }
 

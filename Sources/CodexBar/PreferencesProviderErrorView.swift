@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct ProviderErrorDisplay: Sendable {
+struct ProviderErrorDisplay {
     let preview: String
     let full: String
 }
@@ -26,7 +26,7 @@ struct ProviderErrorView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .help("Copy error")
+                .help(L("Copy error"))
             }
 
             Text(self.display.preview)
@@ -36,7 +36,7 @@ struct ProviderErrorView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             if self.display.preview != self.display.full {
-                Button(self.isExpanded ? "Hide details" : "Show details") { self.isExpanded.toggle() }
+                Button(self.isExpanded ? L("Hide details") : L("Show details")) { self.isExpanded.toggle() }
                     .buttonStyle(.link)
                     .font(.footnote)
             }

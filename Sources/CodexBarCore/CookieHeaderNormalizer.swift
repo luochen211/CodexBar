@@ -7,17 +7,22 @@ public enum CookieHeaderNormalizer {
         #"(?i)\bcookie:\s*'([^']+)'"#,
         #"(?i)\bcookie:\s*\"([^\"]+)\""#,
         #"(?i)\bcookie:\s*([^\r\n]+)"#,
-        #"(?i)(?:--cookie|-b)\s*'([^']+)'"#,
-        #"(?i)(?:--cookie|-b)\s*\"([^\"]+)\""#,
-        #"(?i)(?:--cookie|-b)\s*([^\s]+)"#,
+        #"(?i)(?:^|\s)(?:--cookie|-b)\s*'([^']+)'"#,
+        #"(?i)(?:^|\s)(?:--cookie|-b)\s*\"([^\"]+)\""#,
+        #"(?i)(?:^|\s)-b([^\s=]+=[^\s]+)"#,
+        #"(?i)(?:^|\s)(?:--cookie|-b)\s+([^\s]+)"#,
     ]
 
     public static func normalize(_ raw: String?) -> String? {
+        self.normalize(raw, headerPatterns: self.headerPatterns)
+    }
+
+    static func normalize(_ raw: String?, headerPatterns: [String]) -> String? {
         guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return nil
         }
 
-        if let extracted = self.extractHeader(from: value) {
+        if let extracted = self.extractHeader(from: value, patterns: headerPatterns) {
             value = extracted
         }
 
@@ -50,8 +55,14 @@ public enum CookieHeaderNormalizer {
         return results
     }
 
-    private static func extractHeader(from raw: String) -> String? {
-        for pattern in self.headerPatterns {
+    public static func filteredHeader(from raw: String?, allowedNames: Set<String>) -> String? {
+        let filtered = self.pairs(from: raw ?? "").filter { allowedNames.contains($0.name) }
+        guard !filtered.isEmpty else { return nil }
+        return filtered.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+
+    static func extractHeader(from raw: String, patterns: [String]) -> String? {
+        for pattern in patterns {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
             let range = NSRange(raw.startIndex..<raw.endIndex, in: raw)
             guard let match = regex.firstMatch(in: raw, options: [], range: range),
