@@ -1110,7 +1110,11 @@ extension CostUsageStoreTests {
         #expect(!FileManager.default.fileExists(atPath: input.path))
         let current = CostUsageStore(cacheRoot: fixture.root)
         let after = await current.readSnapshot()
-        #expect(after == before)
+        var expected = before
+        if CostUsageStore.incompatibleRetainedReportPredecessorParserHashes.contains(predecessorHash) {
+            expected.metadata.previousReportPayload = nil
+        }
+        #expect(after == expected)
         #expect(await current.rebuildCount == 0)
         #expect(await current.configuration()?.userVersion == Int(CostUsageStore.schemaVersion))
         let connection = try SQLiteTestConnection(url: fixture.databaseURL, readOnly: true)
