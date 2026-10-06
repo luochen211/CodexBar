@@ -182,8 +182,17 @@ extension CostUsageScanner {
                 ? rowCost?.totalCostUSD ?? aggregateCost
                 : aggregateCost
             let hasModeSplit = rowCostIsTrusted && rowCost?.hasModeSplit == true
-            dayPricedRequestCount = CostUsageIncompleteRequests.sum([dayPricedRequestCount, pricedRows.count])
-            dayUnpricedRequestCount = CostUsageIncompleteRequests.sum([dayUnpricedRequestCount, unpricedRequestCount])
+            let acceptedPricedRequestCount = rowCostIsTrusted ? pricedRows.count : 0
+            let rejectedPricedRequestCount = pricedRows.count - acceptedPricedRequestCount
+            dayPricedRequestCount = CostUsageIncompleteRequests.sum([
+                dayPricedRequestCount,
+                acceptedPricedRequestCount,
+            ])
+            dayUnpricedRequestCount = CostUsageIncompleteRequests.sum([
+                dayUnpricedRequestCount,
+                unpricedRequestCount,
+                rejectedPricedRequestCount,
+            ])
             breakdown.append(
                 CostUsageDailyReport.ModelBreakdown(
                     modelName: model,

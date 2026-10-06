@@ -526,7 +526,8 @@ struct CostUsageCodexSourceRecoveryTests {
         options.refreshMinIntervalSeconds = 3600
         let refreshed = Self.report(day: day, options: options, elapsed: 1)
         #expect(refreshed.summary?.totalTokens == 600_000)
-        #expect(refreshed.summary?.totalCostUSD == nil)
+        #expect(try abs(#require(refreshed.summary?.totalCostUSD) - 0.5) < 1e-9)
+        #expect(refreshed.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 1, unpriced: 2))
         let slice = try #require(refreshed.quotaSlices.first)
         #expect(slice.totalTokens == 600_000)
         #expect(slice.tokensAreComplete)
@@ -539,7 +540,8 @@ struct CostUsageCodexSourceRecoveryTests {
         #expect(reopened.files[file.path]?.days == canonical.files[file.path]?.days)
         #expect(reopened.codexScanCatchUpPending != true)
         let reopenedReport = Self.cachedReport(cache: reopened, day: day)
-        #expect(reopenedReport.summary?.totalCostUSD == nil)
+        #expect(try abs(#require(reopenedReport.summary?.totalCostUSD) - 0.5) < 1e-9)
+        #expect(reopenedReport.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 1, unpriced: 2))
         #expect(reopenedReport.quotaSlices == refreshed.quotaSlices)
 
         let recorder = CostUsageScanner.CodexScanWorkRecorder()
@@ -547,7 +549,8 @@ struct CostUsageCodexSourceRecoveryTests {
         options.refreshMinIntervalSeconds = 0
         let repeated = Self.report(day: day, options: options, elapsed: 2)
         #expect(repeated.summary?.totalTokens == 600_000)
-        #expect(repeated.summary?.totalCostUSD == nil)
+        #expect(try abs(#require(repeated.summary?.totalCostUSD) - 0.5) < 1e-9)
+        #expect(repeated.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 1, unpriced: 2))
         #expect(repeated.quotaSlices == refreshed.quotaSlices)
         #expect(recorder.snapshot().usageRowsProcessed == 0)
         #expect(recorder.snapshot().usageRowsRepriced == 0)

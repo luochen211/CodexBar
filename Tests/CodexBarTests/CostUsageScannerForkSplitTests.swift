@@ -318,6 +318,7 @@ struct CostUsageScannerForkSplitTests {
         let modeMismatch = CostUsageScanner.buildCodexReportFromCache(cache: cache, range: range)
         #expect(modeMismatch.summary?.totalTokens == 400_100)
         #expect(modeMismatch.summary?.totalCostUSD == nil)
+        #expect(modeMismatch.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 0, unpriced: 1))
     }
 
     @Test
@@ -519,8 +520,14 @@ struct CostUsageScannerForkSplitTests {
         cache.files = ["/partial-pricing.jsonl": usage]
         cache.days = usage.days
         let report = CostUsageScanner.buildCodexReportFromCache(cache: cache, range: range)
-        #expect(report.data.first?.modelBreakdowns?.first?.costUSD == nil)
-        #expect(report.summary?.totalCostUSD == nil)
+        let pricedCost = try #require(CostUsagePricing.codexCostUSD(
+            model: model,
+            inputTokens: 100_000,
+            cachedInputTokens: 0,
+            outputTokens: 10))
+        #expect(abs((report.data.first?.modelBreakdowns?.first?.costUSD ?? 0) - pricedCost) < 1e-12)
+        #expect(abs((report.summary?.totalCostUSD ?? 0) - pricedCost) < 1e-12)
+        #expect(report.data.first?.coverageCounts == CostUsageCoverageCounts(priced: 1, unpriced: 1))
 
         let authoritativeZero = CostUsageScanner.CodexUsageRow(
             day: dayKey,
