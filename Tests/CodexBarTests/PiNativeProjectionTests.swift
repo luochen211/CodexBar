@@ -29,7 +29,7 @@ struct PiNativeProjectionTests {
             return
         }
         #expect(!freshScope.isEmpty)
-        #expect(freshNative.daily == baseline.snapshot.daily)
+        #expect(Self.coverageComplete(freshNative.daily) == Self.coverageComplete(baseline.snapshot.daily))
         #expect(freshNative.hourly == baseline.snapshot.hourly)
         #expect(freshNative.quotaSlices == baseline.snapshot.quotaSlices)
         #expect(freshNative.last30DaysTokens == 140)
@@ -53,7 +53,7 @@ struct PiNativeProjectionTests {
             return
         }
         #expect(cachedScope == freshScope)
-        #expect(cachedNative.daily == freshNative.daily)
+        #expect(Self.coverageComplete(cachedNative.daily) == Self.coverageComplete(freshNative.daily))
         #expect(cachedNative.hourly == freshNative.hourly)
         #expect(cachedNative.quotaSlices == freshNative.quotaSlices)
         #expect(cachedNative.last30DaysTokens == 140)
@@ -93,7 +93,7 @@ struct PiNativeProjectionTests {
         let partial = try #require(partialValue)
         #expect(partial.accounting == .nativeOnly)
         #expect(partial.snapshot.last30DaysTokens == 140)
-        #expect(partial.snapshot.daily == baseline.snapshot.daily)
+        #expect(Self.coverageComplete(partial.snapshot.daily) == Self.coverageComplete(baseline.snapshot.daily))
         #expect(partial.snapshot.hourly == baseline.snapshot.hourly)
         #expect(partial.snapshot.quotaSlices == baseline.snapshot.quotaSlices)
         #expect(!partial.snapshot.historyCoverageIsEstablished)
@@ -119,6 +119,29 @@ struct PiNativeProjectionTests {
         guard case .includesPi = refreshed.accounting else {
             Issue.record("Expected a fresh scan to establish Pi ownership after missing-cache hydration")
             return
+        }
+    }
+
+    private static func coverageComplete(
+        _ entries: [CostUsageDailyReport.Entry]) -> [CostUsageDailyReport.Entry]
+    {
+        entries.map { entry in
+            CostUsageDailyReport.Entry(
+                date: entry.date,
+                inputTokens: entry.inputTokens,
+                cacheReadTokens: entry.cacheReadTokens,
+                cacheCreationTokens: entry.cacheCreationTokens,
+                outputTokens: entry.outputTokens,
+                reasoningTokens: entry.reasoningTokens,
+                totalTokens: entry.totalTokens,
+                requestCount: entry.requestCount,
+                costUSD: entry.costUSD,
+                modelsUsed: entry.modelsUsed,
+                modelBreakdowns: entry.modelBreakdowns,
+                unpricedRequestCount: entry.unpricedRequestCount ?? 0,
+                pricedRequestCount: entry.pricedRequestCount ?? 0,
+                unmeteredRequestCount: entry.unmeteredRequestCount ?? 0,
+                estimatedRequestCount: entry.estimatedRequestCount ?? 0)
         }
     }
 

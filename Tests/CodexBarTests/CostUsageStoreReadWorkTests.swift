@@ -86,10 +86,33 @@ struct CostUsageStoreReadWorkTests {
             historyDays: 1,
             historyCoverageIsEstablished: coverage,
             costProvenance: .listPriceEstimate,
-            daily: full.daily,
+            daily: Self.coverageComplete(full.daily),
             projects: retainedReport ? [] : full.projects,
             sessions: retainedReport ? [] : full.sessions,
             updatedAt: fixture.now.addingTimeInterval(retainedReport ? -60 : 0))
+    }
+
+    private static func coverageComplete(
+        _ entries: [CostUsageDailyReport.Entry]) -> [CostUsageDailyReport.Entry]
+    {
+        entries.map { entry in
+            CostUsageDailyReport.Entry(
+                date: entry.date,
+                inputTokens: entry.inputTokens,
+                cacheReadTokens: entry.cacheReadTokens,
+                cacheCreationTokens: entry.cacheCreationTokens,
+                outputTokens: entry.outputTokens,
+                reasoningTokens: entry.reasoningTokens,
+                totalTokens: entry.totalTokens,
+                requestCount: entry.requestCount,
+                costUSD: entry.costUSD,
+                modelsUsed: entry.modelsUsed,
+                modelBreakdowns: entry.modelBreakdowns,
+                unpricedRequestCount: entry.unpricedRequestCount ?? 0,
+                pricedRequestCount: entry.pricedRequestCount ?? 0,
+                unmeteredRequestCount: entry.unmeteredRequestCount ?? 0,
+                estimatedRequestCount: entry.estimatedRequestCount ?? 0)
+        }
     }
 
     @Test(arguments: [2, 16])
