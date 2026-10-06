@@ -99,9 +99,9 @@ struct CostUsageStoreReadWorkTests {
             CostUsageDailyReport.Entry(
                 date: entry.date,
                 inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
                 cacheReadTokens: entry.cacheReadTokens,
                 cacheCreationTokens: entry.cacheCreationTokens,
-                outputTokens: entry.outputTokens,
                 reasoningTokens: entry.reasoningTokens,
                 totalTokens: entry.totalTokens,
                 requestCount: entry.requestCount,
