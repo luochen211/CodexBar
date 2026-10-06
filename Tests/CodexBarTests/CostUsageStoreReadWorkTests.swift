@@ -133,7 +133,7 @@ struct CostUsageStoreReadWorkTests {
             meteredCostUSD: snapshot.meteredCostUSD,
             costProvenance: snapshot.costProvenance,
             credentialScopeFingerprint: snapshot.credentialScopeFingerprint,
-            daily: coverageComplete(snapshot.daily),
+            daily: self.coverageComplete(snapshot.daily),
             projects: snapshot.projects,
             sessions: snapshot.sessions,
             hourly: snapshot.hourly,
